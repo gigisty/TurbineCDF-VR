@@ -1,0 +1,10 @@
+<ui:UXML xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements" noNamespaceSchemaLocation="../../UIElementsSchema/UIElements.xsd" editor-extension-mode="False">
+    <ui:VisualElement style="flex-grow: 1;">
+        <ui:Label text="Wind Turbine CDF&#10;" style="-unity-text-align: upper-center; white-space: nowrap; text-overflow: clip; font-size: 36px; height: 62px; color: rgb(255, 255, 255);"/>
+        <ui:VisualElement style="flex-grow: 1; width: 411px; align-items: stretch; justify-content: space-around; align-self: auto; align-content: flex-start;">
+            <ui:Button text="Button" style="height: 84px;"/>
+            <ui:Button text="Button" style="height: 84px;"/>
+            <ui:Button text="Button" style="height: 84px;"/>
+        </ui:VisualElement>
+    </ui:VisualElement>
+</ui:UXML>
