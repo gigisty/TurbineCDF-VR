@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 6de82863e16c040a99fc29a922c9812f
+DefaultImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Destruction/Demo 4 - Voronoi Fracture Wall Destruction.unity
+  uploadId: 959622

@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 75c75d74328d84ec5ae827fcc864441b
+PrefabImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Z-Demo Assets/Prefabs/Models/Propeller.prefab
+  uploadId: 959622

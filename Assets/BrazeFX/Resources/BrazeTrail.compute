@@ -1,0 +1,540 @@
+// BrazeFX GPU particle trail recorder.
+//
+// Reads live positions from BrazeParticleSystem's particle buffer, records one history ring per particle slot, then
+// builds ribbon nodes for each slot. A GPU-side visibility pass picks a stable percentage of alive particle slots for
+// indirect ribbon drawing.
+
+#pragma kernel ClearTrail
+#pragma kernel ClearSourceMap
+#pragma kernel BuildSourceMapDirect
+#pragma kernel PrepareParticleFrame
+#pragma kernel PrepareClonerFrame
+#pragma kernel TrailAppend
+#pragma kernel TrailAppendCloner
+#pragma kernel WriteNodeDispatchArgs
+#pragma kernel BuildLineNodes
+#pragma kernel BuildClonerLineNodes
+#pragma kernel BuildTrailBounds
+#pragma kernel PrepareCull
+#pragma kernel CullTrails
+
+#include "../Shaders/BrazeParticleStruct.hlsl"
+
+StructuredBuffer<Particle> _Particles;
+StructuredBuffer<uint> _SourceVisible;
+StructuredBuffer<uint> _SourceArgs;
+StructuredBuffer<float4> _CloneBasePosition;
+StructuredBuffer<float4> _ClonePositionOffset;
+
+RWStructuredBuffer<float4> _Trail; // capacity * points; xyz = world position, w = asfloat(seed)
+RWStructuredBuffer<uint> _TrailSource;   // dense trail slot -> stable source slot
+RWStructuredBuffer<uint> _SourceToTrail; // source slot -> dense trail slot (INVALID when untracked)
+
+struct LineNode
+{
+    float4 posT;  // xyz = particle-space spine position, w = normalized trail u (head 0 -> tail 1)
+    float4 color; // xyz = particle-space tangent (reuses the legacy, shader-unused colour lane)
+    float4 misc;  // x = ramp u, y = age u (-1 for infinite life), z = valid, w = seed phase
+};
+
+RWStructuredBuffer<LineNode> _LineNodes; // capacity * node count
+RWStructuredBuffer<float4> _TrailBounds; // xyz = world-space center, w = conservative sphere radius (-1 invalid)
+RWStructuredBuffer<uint> _TrackedTrail;  // compact alive list; values are dense trail slots
+RWStructuredBuffer<uint> _TrackedArgs;   // indexed args layout; [1] is the compact tracked count
+RWStructuredBuffer<uint> _DrawVisible;   // camera-culled trail slots consumed by the ribbon shader
+RWStructuredBuffer<uint> _DrawArgs;
+RWStructuredBuffer<uint> _ParticleDispatchArgs;
+RWStructuredBuffer<uint> _NodeDispatchArgs;
+RWStructuredBuffer<uint> _CullDispatchArgs;
+
+uint _Capacity;
+uint _SourceCapacity;
+uint _SourceSeed;
+uint _Points;
+uint _RingHead;
+uint _FillCount;
+uint _NodeCount;
+uint _DrawSegments;
+uint _SegVerts;
+int  _RowThreads;
+
+float4x4 _Model;
+float4x4 _WorldToParticle;
+float _PathSmoothing;
+float _TrailPhase;
+float _SampleInterval;
+float _CullRadius;
+float4 _CullPlanes[6];
+uint _CullOn;
+
+static const uint INVALID = 0xFFFFFFFFu;
+
+uint FlatIndex(uint3 gid)
+{
+    return gid.y * (uint)_RowThreads + gid.x;
+}
+
+uint IndirectFlatIndex(uint3 gid, uint groupsX)
+{
+    return gid.y * groupsX * 64u + gid.x;
+}
+
+uint2 ResolveDispatchGrid(uint threads)
+{
+    uint groups = (threads + 63u) / 64u;
+    uint gx = min(groups, 65535u);
+    uint gy = gx > 0u ? (groups + gx - 1u) / gx : 0u;
+    return uint2(gx, gy);
+}
+
+uint HashUint(uint value)
+{
+    value ^= value >> 16u;
+    value *= 0x7FEB352Du;
+    value ^= value >> 15u;
+    value *= 0x846CA68Bu;
+    value ^= value >> 16u;
+    return value;
+}
+
+// Exact floor(((2*index+1) * total) / (2*count)) using a 16-bit-limb 32x32 product and a 64/32 divide.
+// Mapping runs only when capacity/ratio changes; hot per-frame kernels read the resulting lookup buffers directly.
+uint EvenSourceIndex(uint index, uint count, uint total)
+{
+    uint result = INVALID;
+    if (total > 0u)
+    {
+        if (count >= total)
+        {
+            result = min(index, total - 1u);
+        }
+        else if (count > 0u)
+        {
+            uint a = index * 2u + 1u;
+            uint a0 = a & 0xFFFFu;
+            uint a1 = a >> 16u;
+            uint b0 = total & 0xFFFFu;
+            uint b1 = total >> 16u;
+            uint p00 = a0 * b0;
+            uint p01 = a0 * b1;
+            uint p10 = a1 * b0;
+            uint p11 = a1 * b1;
+            uint middle = (p00 >> 16u) + (p01 & 0xFFFFu) + (p10 & 0xFFFFu);
+            uint low = (p00 & 0xFFFFu) | (middle << 16u);
+            uint high = p11 + (p01 >> 16u) + (p10 >> 16u) + (middle >> 16u);
+            uint divisor = count * 2u;
+
+            uint remainder = high; // quotient <= total, therefore high is below divisor here
+            uint quotient = 0u;
+            [loop]
+            for (int bit = 31; bit >= 0; bit--)
+            {
+                remainder = (remainder << 1u) | ((low >> (uint)bit) & 1u);
+                if (remainder >= divisor)
+                {
+                    remainder -= divisor;
+                    quotient |= 1u << (uint)bit;
+                }
+            }
+            result = min(quotient, total - 1u);
+        }
+    }
+    return result;
+}
+
+uint SourceIndexForTrail(uint trailSlot)
+{
+    return trailSlot < _Capacity ? _TrailSource[trailSlot] : INVALID;
+}
+
+uint CloneSeed(uint cloneIndex)
+{
+    return HashUint(cloneIndex ^ _SourceSeed ^ 0x9E3779B9u);
+}
+
+float3 ClonePosition(uint cloneIndex)
+{
+    return _CloneBasePosition[cloneIndex].xyz + _ClonePositionOffset[cloneIndex].xyz;
+}
+
+[numthreads(64, 1, 1)]
+void ClearSourceMap(uint3 gid : SV_DispatchThreadID)
+{
+    uint sourceSlot = FlatIndex(gid);
+    if (sourceSlot < _SourceCapacity) _SourceToTrail[sourceSlot] = INVALID;
+}
+
+[numthreads(64, 1, 1)]
+void BuildSourceMapDirect(uint3 gid : SV_DispatchThreadID)
+{
+    uint trailSlot = FlatIndex(gid);
+    if (trailSlot >= _Capacity) return;
+    uint sourceSlot = EvenSourceIndex(trailSlot, _Capacity, _SourceCapacity);
+    _TrailSource[trailSlot] = sourceSlot;
+    _SourceToTrail[sourceSlot] = trailSlot;
+}
+
+[numthreads(1, 1, 1)]
+void PrepareParticleFrame(uint3 id : SV_DispatchThreadID)
+{
+    uint alive = _SourceArgs[1];
+    bool scanAlive = alive <= _Capacity;
+    _TrackedArgs[0] = _SegVerts;
+    _TrackedArgs[1] = 0u;
+    _TrackedArgs[2] = 0u;
+    _TrackedArgs[3] = 0u;
+    _TrackedArgs[4] = scanAlive ? 1u : 0u; // private frame metadata; draw args always reset startInstance to zero
+    uint2 grid = ResolveDispatchGrid(min(alive, _Capacity));
+    _ParticleDispatchArgs[0] = grid.x;
+    _ParticleDispatchArgs[1] = grid.y;
+    _ParticleDispatchArgs[2] = 1u;
+}
+
+[numthreads(1, 1, 1)]
+void PrepareClonerFrame(uint3 id : SV_DispatchThreadID)
+{
+    _TrackedArgs[0] = _SegVerts;
+    _TrackedArgs[1] = _Capacity;
+    _TrackedArgs[2] = 0u;
+    _TrackedArgs[3] = 0u;
+    _TrackedArgs[4] = 0u;
+    uint2 grid = ResolveDispatchGrid(_Capacity);
+    _ParticleDispatchArgs[0] = grid.x;
+    _ParticleDispatchArgs[1] = grid.y;
+    _ParticleDispatchArgs[2] = 1u;
+}
+
+float4 ReadTrailSample(uint slot, uint seed, float sample, uint historyCap)
+{
+    if (sample < 0.0) sample = 0.0;
+    if (sample > (float)historyCap) sample = (float)historyCap;
+
+    uint a = (uint)floor(sample);
+    if (a > historyCap) a = historyCap;
+    uint b = a + 1u;
+    if (b > historyCap) b = historyCap;
+    float f = sample - (float)a;
+
+    uint baseIdx = slot * _Points;
+    float4 pa = _Trail[baseIdx + (_RingHead + _Points - a) % _Points];
+    float4 pb = _Trail[baseIdx + (_RingHead + _Points - b) % _Points];
+    bool va = asuint(pa.w) == seed;
+    bool vb = asuint(pb.w) == seed;
+
+    float4 result = float4(0.0, 0.0, 0.0, 0.0);
+    if (va && vb) result = float4(lerp(pa.xyz, pb.xyz, f), 1.0);
+    else if (va) result = float4(pa.xyz, 1.0);
+    else if (vb) result = float4(pb.xyz, 1.0);
+    return result;
+}
+
+[numthreads(64, 1, 1)]
+void ClearTrail(uint3 gid : SV_DispatchThreadID)
+{
+    uint i = FlatIndex(gid);
+    if (i >= _Capacity * _Points) return;
+    _Trail[i] = float4(0.0, 0.0, 0.0, asfloat(INVALID));
+}
+
+[numthreads(64, 1, 1)]
+void TrailAppend(uint3 gid : SV_DispatchThreadID)
+{
+    uint workIndex = IndirectFlatIndex(gid, _ParticleDispatchArgs[0]);
+    uint trailSlot = INVALID;
+    uint sourceSlot = INVALID;
+    if (_TrackedArgs[4] != 0u)
+    {
+        if (workIndex >= _SourceArgs[1]) return;
+        sourceSlot = _SourceVisible[workIndex];
+        if (sourceSlot >= _SourceCapacity) return;
+        uint mappedTrail = _SourceToTrail[sourceSlot];
+        if (mappedTrail < _Capacity) trailSlot = mappedTrail;
+        if (trailSlot == INVALID) return;
+    }
+    else
+    {
+        if (workIndex >= _Capacity) return;
+        trailSlot = workIndex;
+        sourceSlot = SourceIndexForTrail(trailSlot);
+    }
+
+    Particle p = _Particles[sourceSlot];
+    if (!ParticleAlive(p)) return;
+
+    if (_FillCount > 0u)
+    {
+        float4 sample = float4(mul(_Model, float4(p.position, 1.0)).xyz,
+                              asfloat(ParticleRandomSeed(p)));
+        uint fill = min(_FillCount, _Points);
+        for (uint j = 0u; j < fill; j++)
+            _Trail[trailSlot * _Points + (_RingHead + _Points - j) % _Points] = sample;
+    }
+
+    uint dst;
+    InterlockedAdd(_TrackedArgs[1], 1u, dst);
+    _TrackedTrail[dst] = trailSlot;
+    _DrawVisible[dst] = trailSlot; // unculled fallback; camera rendering compacts this again in CullTrails
+}
+
+[numthreads(64, 1, 1)]
+void TrailAppendCloner(uint3 gid : SV_DispatchThreadID)
+{
+    uint slot = IndirectFlatIndex(gid, _ParticleDispatchArgs[0]);
+    if (slot >= _Capacity || _SourceCapacity == 0u) return;
+
+    uint cloneIndex = SourceIndexForTrail(slot);
+    if (_FillCount > 0u)
+    {
+        float4 sample = float4(ClonePosition(cloneIndex), asfloat(CloneSeed(cloneIndex)));
+        uint fill = min(_FillCount, _Points);
+        for (uint j = 0u; j < fill; j++)
+            _Trail[slot * _Points + (_RingHead + _Points - j) % _Points] = sample;
+    }
+    _TrackedTrail[slot] = slot;
+    _DrawVisible[slot] = slot;
+}
+
+[numthreads(1, 1, 1)]
+void WriteNodeDispatchArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint2 grid = ResolveDispatchGrid(_TrackedArgs[1] * _NodeCount);
+    _NodeDispatchArgs[0] = grid.x;
+    _NodeDispatchArgs[1] = grid.y;
+    _NodeDispatchArgs[2] = 1u;
+    uint2 cullGrid = ResolveDispatchGrid(_TrackedArgs[1]);
+    _CullDispatchArgs[0] = cullGrid.x;
+    _CullDispatchArgs[1] = cullGrid.y;
+    _CullDispatchArgs[2] = 1u;
+    _DrawArgs[0] = _TrackedArgs[0];
+    _DrawArgs[1] = _TrackedArgs[1];
+    _DrawArgs[2] = 0u;
+    _DrawArgs[3] = 0u;
+    _DrawArgs[4] = 0u;
+}
+
+[numthreads(64, 1, 1)]
+void BuildLineNodes(uint3 gid : SV_DispatchThreadID)
+{
+    uint flat = IndirectFlatIndex(gid, _NodeDispatchArgs[0]);
+    uint total = _TrackedArgs[1] * _NodeCount;
+    if (flat >= total) return;
+
+    uint trackedIndex = flat / _NodeCount;
+    uint node = flat - trackedIndex * _NodeCount;
+    uint trailSlot = _TrackedTrail[trackedIndex];
+    uint sourceSlot = SourceIndexForTrail(trailSlot);
+    uint outputIndex = trailSlot * _NodeCount + node;
+    Particle p = _Particles[sourceSlot];
+
+    LineNode n;
+    n.posT = float4(p.position, 0.0);
+    n.color = float4(0.0, 1.0, 0.0, 1.0);
+    n.misc = float4(0.0, -1.0, 0.0, frac((float)ParticleRandomSeed(p) * 0.00006103515625));
+
+    if (node > _DrawSegments || !ParticleAlive(p))
+    {
+        _LineNodes[outputIndex] = n;
+        return;
+    }
+
+    float t = (_DrawSegments > 0u) ? (float)node / (float)_DrawSegments : 0.0;
+    float life = ParticleLifetime(p);
+    float ageU = (life < 65000.0) ? saturate(p.age / max(life, 1e-5)) : -1.0;
+    uint historyCap = _Points > 1u ? _Points - 1u : 1u;
+    float historyDur = _SampleInterval * (float)historyCap;
+    float span = min(max(p.age, 0.0), historyDur);
+    float sampleAge = t * span;
+    float sample = 0.0;
+    if (sampleAge <= _TrailPhase)
+        sample = _TrailPhase > 1e-5 ? saturate(sampleAge / _TrailPhase) : 0.0;
+    else
+        sample = 1.0 + (sampleAge - _TrailPhase) / max(_SampleInterval, 1e-5);
+
+    uint seed = ParticleRandomSeed(p);
+    float4 trail = ReadTrailSample(trailSlot, seed, sample, historyCap);
+    float stride = (float)historyCap / max((float)_DrawSegments, 1.0);
+    float4 newer = node > 0u ? ReadTrailSample(trailSlot, seed, sample - stride, historyCap) : 0.0;
+    float4 older = node < _DrawSegments ? ReadTrailSample(trailSlot, seed, sample + stride, historyCap) : 0.0;
+    bool trailValid = trail.w > 0.5;
+    if (node > 0u && _PathSmoothing > 1e-4 && trail.w > 0.5)
+    {
+        float3 smoothed = trail.xyz;
+        float weight = 1.0;
+        if (newer.w > 0.5)
+        {
+            smoothed += newer.xyz;
+            weight += 1.0;
+        }
+        if (older.w > 0.5)
+        {
+            smoothed += older.xyz;
+            weight += 1.0;
+        }
+        trail.xyz = lerp(trail.xyz, smoothed / weight, saturate(_PathSmoothing));
+    }
+
+    if (node == 0u)
+    {
+        trail = float4(mul(_Model, float4(p.position, 1.0)).xyz, 1.0);
+        trailValid = true;
+    }
+    else if (!trailValid && newer.w > 0.5)
+        trail.xyz = newer.xyz; // collapse the first unfilled cap onto the last valid node
+
+    if (trailValid || newer.w > 0.5)
+        n.posT = float4(mul(_WorldToParticle, float4(trail.xyz, 1.0)).xyz, t);
+
+    float3 tangentWorld = float3(0.0, 1.0, 0.0);
+    if (newer.w > 0.5 && older.w > 0.5) tangentWorld = older.xyz - newer.xyz;
+    else if (older.w > 0.5) tangentWorld = older.xyz - trail.xyz;
+    else if (newer.w > 0.5) tangentWorld = trail.xyz - newer.xyz;
+    n.color = float4(mul((float3x3)_WorldToParticle, tangentWorld), 1.0);
+    n.misc = float4(t, ageU, trailValid ? 1.0 : 0.0, n.misc.w);
+    _LineNodes[outputIndex] = n;
+}
+
+[numthreads(64, 1, 1)]
+void BuildClonerLineNodes(uint3 gid : SV_DispatchThreadID)
+{
+    uint flat = IndirectFlatIndex(gid, _NodeDispatchArgs[0]);
+    uint total = _TrackedArgs[1] * _NodeCount;
+    if (flat >= total || _SourceCapacity == 0u) return;
+
+    uint trackedIndex = flat / _NodeCount;
+    uint node = flat - trackedIndex * _NodeCount;
+    uint slot = _TrackedTrail[trackedIndex];
+    uint outputIndex = slot * _NodeCount + node;
+    uint cloneIndex = SourceIndexForTrail(slot);
+    uint seed = CloneSeed(cloneIndex);
+    float3 currentPosition = ClonePosition(cloneIndex);
+
+    LineNode n;
+    n.posT = float4(currentPosition, 0.0);
+    n.color = float4(0.0, 1.0, 0.0, 1.0);
+    n.misc = float4(0.0, -1.0, 0.0, frac((float)seed * 0.00006103515625));
+
+    if (node > _DrawSegments)
+    {
+        _LineNodes[outputIndex] = n;
+        return;
+    }
+
+    float t = (_DrawSegments > 0u) ? (float)node / (float)_DrawSegments : 0.0;
+    uint historyCap = _Points > 1u ? _Points - 1u : 1u;
+    float historyDur = _SampleInterval * (float)historyCap;
+    float sampleAge = t * historyDur;
+    float sample = 0.0;
+    if (sampleAge <= _TrailPhase)
+        sample = _TrailPhase > 1e-5 ? saturate(sampleAge / _TrailPhase) : 0.0;
+    else
+        sample = 1.0 + (sampleAge - _TrailPhase) / max(_SampleInterval, 1e-5);
+
+    float4 trail = ReadTrailSample(slot, seed, sample, historyCap);
+    float stride = (float)historyCap / max((float)_DrawSegments, 1.0);
+    float4 newer = node > 0u ? ReadTrailSample(slot, seed, sample - stride, historyCap) : 0.0;
+    float4 older = node < _DrawSegments ? ReadTrailSample(slot, seed, sample + stride, historyCap) : 0.0;
+    bool trailValid = trail.w > 0.5;
+    if (node > 0u && _PathSmoothing > 1e-4 && trail.w > 0.5)
+    {
+        float3 smoothed = trail.xyz;
+        float weight = 1.0;
+        if (newer.w > 0.5)
+        {
+            smoothed += newer.xyz;
+            weight += 1.0;
+        }
+        if (older.w > 0.5)
+        {
+            smoothed += older.xyz;
+            weight += 1.0;
+        }
+        trail.xyz = lerp(trail.xyz, smoothed / weight, saturate(_PathSmoothing));
+    }
+
+    if (node == 0u)
+    {
+        trail = float4(currentPosition, 1.0);
+        trailValid = true;
+    }
+    else if (!trailValid && newer.w > 0.5)
+        trail.xyz = newer.xyz;
+
+    if (trailValid || newer.w > 0.5)
+        n.posT = float4(trail.xyz, t);
+
+    float3 tangent = float3(0.0, 1.0, 0.0);
+    if (newer.w > 0.5 && older.w > 0.5) tangent = older.xyz - newer.xyz;
+    else if (older.w > 0.5) tangent = older.xyz - trail.xyz;
+    else if (newer.w > 0.5) tangent = trail.xyz - newer.xyz;
+    n.color = float4(tangent, 1.0);
+    n.misc = float4(t, -1.0, trailValid ? 1.0 : 0.0, n.misc.w);
+    _LineNodes[outputIndex] = n;
+}
+
+[numthreads(64, 1, 1)]
+void BuildTrailBounds(uint3 gid : SV_DispatchThreadID)
+{
+    uint trackedIndex = IndirectFlatIndex(gid, _CullDispatchArgs[0]);
+    if (trackedIndex >= _TrackedArgs[1]) return;
+
+    uint slot = _TrackedTrail[trackedIndex];
+    float3 boundsMin = float3(3.402823466e+38, 3.402823466e+38, 3.402823466e+38);
+    float3 boundsMax = -boundsMin;
+    bool any = false;
+    uint baseIndex = slot * _NodeCount;
+    [loop]
+    for (uint node = 0u; node <= _DrawSegments; node++)
+    {
+        LineNode n = _LineNodes[baseIndex + node];
+        if (n.misc.z <= 0.5) continue;
+        float3 worldPosition = mul(_Model, float4(n.posT.xyz, 1.0)).xyz;
+        boundsMin = min(boundsMin, worldPosition);
+        boundsMax = max(boundsMax, worldPosition);
+        any = true;
+    }
+
+    if (!any)
+    {
+        _TrailBounds[slot] = float4(0.0, 0.0, 0.0, -1.0);
+        return;
+    }
+
+    float3 center = (boundsMin + boundsMax) * 0.5;
+    float radius = length((boundsMax - boundsMin) * 0.5) + _CullRadius;
+    _TrailBounds[slot] = float4(center, radius);
+}
+
+[numthreads(1, 1, 1)]
+void PrepareCull(uint3 id : SV_DispatchThreadID)
+{
+    _DrawArgs[0] = _SegVerts;
+    _DrawArgs[1] = 0u;
+    _DrawArgs[2] = 0u;
+    _DrawArgs[3] = 0u;
+    _DrawArgs[4] = 0u;
+    uint2 grid = ResolveDispatchGrid(_TrackedArgs[1]);
+    _CullDispatchArgs[0] = grid.x;
+    _CullDispatchArgs[1] = grid.y;
+    _CullDispatchArgs[2] = 1u;
+}
+
+[numthreads(64, 1, 1)]
+void CullTrails(uint3 gid : SV_DispatchThreadID)
+{
+    uint trackedIndex = IndirectFlatIndex(gid, _CullDispatchArgs[0]);
+    if (trackedIndex >= _TrackedArgs[1]) return;
+
+    uint slot = _TrackedTrail[trackedIndex];
+    if (_CullOn != 0u)
+    {
+        float4 bounds = _TrailBounds[slot];
+        if (bounds.w < 0.0) return;
+        [unroll]
+        for (uint plane = 0u; plane < 6u; plane++)
+            if (dot(_CullPlanes[plane].xyz, bounds.xyz) + _CullPlanes[plane].w < -bounds.w) return;
+    }
+
+    uint dst;
+    InterlockedAdd(_DrawArgs[1], 1u, dst);
+    _DrawVisible[dst] = slot;
+}

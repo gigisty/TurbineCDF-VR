@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 7d8f6c2a8f4d4e0b9f0c6a1b2d3e4f51
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/BrazeContainer.SliceRenderer.cs
+  uploadId: 959622

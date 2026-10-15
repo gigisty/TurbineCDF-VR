@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 2d1ab68f713d46fca804aa6d1b8f344e
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {fileID: 2800000, guid: 1ca8e1a26225b4af180ce785d61c2cdc, type: 3}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/BrazePushApartEffector.cs
+  uploadId: 959622

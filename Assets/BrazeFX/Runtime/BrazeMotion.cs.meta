@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 94b99590ce1f427abf3f272ff6e6d602
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {fileID: 2800000, guid: bbd1e225975664095bb74f262555ca6c, type: 3}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/BrazeMotion.cs
+  uploadId: 959622

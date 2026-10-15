@@ -1,0 +1,16 @@
+fileFormatVersion: 2
+guid: c6a99ca96b354f6fb0d7c5d91c1a7423
+ShaderImporter:
+  externalObjects: {}
+  defaultTextures: []
+  nonModifiableTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Shaders/BrazeVoronoiWire.shader
+  uploadId: 959622

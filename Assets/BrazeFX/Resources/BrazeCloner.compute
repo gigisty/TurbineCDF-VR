@@ -1,0 +1,873 @@
+#pragma kernel BuildClones
+#pragma kernel ClearBuckets
+#pragma kernel CullAndBucket
+#pragma kernel CullAndBucketComposed
+#pragma kernel WriteDrawArgs
+#pragma kernel ClearPushApartRadius
+#pragma kernel MeasurePushApartRadius
+#pragma kernel ClearPushApartGrid
+#pragma kernel BuildPushApartGrid
+#pragma kernel CapturePushApartBakeInput
+#pragma kernel ApplyPushApartBake
+#pragma kernel PushApart
+#pragma kernel StorePushApartBake
+#pragma kernel MeasureCloneSpeed
+
+#define THREADS 64
+#define MAX_LODS 4
+#define MAX_PUSH_CANDIDATES 512
+
+struct CloneSource
+{
+    float radius;
+    uint lodCount;
+    float2 padding;
+    float4 thresholds;
+};
+
+struct MeshSample
+{
+    float3 position;
+    float positionPadding;
+    float3 normal;
+    float normalPadding;
+};
+
+struct IndirectArgs
+{
+    uint indexCountPerInstance;
+    uint instanceCount;
+    uint startIndex;
+    uint baseVertexIndex;
+    uint startInstance;
+};
+
+struct GpuFractureEffector
+{
+    float3 position;       float shape;
+    float3 boxHalf;        float radius;
+    float4 rotation;
+    float3 positionAmount; float strength;
+    float3 rotationAmount; float falloffRow;
+    float3 scaleAmount;    int auxOffset;
+    int functionType;      int mode;
+    int seed;              int flags;
+    float4 parameters;
+    float4 special0;
+    float4 special1;
+};
+
+RWStructuredBuffer<float4> _BasePosition;
+RWStructuredBuffer<float4> _BaseRotation;
+RWStructuredBuffer<float4> _BaseScale;
+StructuredBuffer<float4> _BasePositionRead;
+StructuredBuffer<float4> _BaseScaleRead;
+StructuredBuffer<float4> _EffectorPositionRead;
+StructuredBuffer<float4> _EffectorScaleRead;
+StructuredBuffer<MeshSample> _MeshSamples;
+RWStructuredBuffer<float4> _EffectorPositionWrite;
+RWStructuredBuffer<float> _AppearanceSpeed;
+RWStructuredBuffer<float4> _AppearancePreviousPosition;
+RWStructuredBuffer<int> _PushGridHeads;
+RWStructuredBuffer<int> _PushGridNext;
+RWStructuredBuffer<int4> _PushGridCells;
+RWStructuredBuffer<float> _PushRadii;
+RWStructuredBuffer<uint> _PushMaxRadius;
+StructuredBuffer<float4> _PushBakeRead;
+RWStructuredBuffer<float4> _PushBakeWrite;
+RWStructuredBuffer<float4> _PushInputPosition;
+
+StructuredBuffer<CloneSource> _Sources;
+RWStructuredBuffer<uint> _VisibleIndices;
+RWStructuredBuffer<uint> _BucketCounts;
+StructuredBuffer<uint> _BucketCountsRead;
+StructuredBuffer<uint2> _DrawBuckets;
+RWStructuredBuffer<IndirectArgs> _DrawArgs;
+
+// Composed (nested-cloner) culling: the parent transform stream plus the child cloner's live buffers.
+StructuredBuffer<float4> _BaseRotationRead;
+StructuredBuffer<float4> _EffectorRotationRead;
+StructuredBuffer<float4> _NestedBasePosition;
+StructuredBuffer<float4> _NestedBaseScale;
+StructuredBuffer<float4> _NestedEffectorPosition;
+StructuredBuffer<float4> _NestedEffectorScale;
+StructuredBuffer<CloneSource> _NestedSources;
+
+StructuredBuffer<GpuFractureEffector> _Effectors;
+StructuredBuffer<float> _EffectorFalloff;
+
+uint _InstanceCount;
+uint _BucketCount;
+uint _DrawCount;
+uint _SourceCount;
+uint _SourceCapacity;
+uint _SourceOrder;
+uint _Distribution;
+uint _Seed;
+uint _Center;
+uint _RadialBaseCount;
+uint _RadialRingCount;
+uint _RadialCountStep;
+uint _RadialPlane;
+uint _RadialCenterAxis;
+uint _Alignment;
+uint _AlignmentAxis;
+uint _AlignmentUp;
+uint _Orthographic;
+uint _EffectorIndex;
+uint _EffectorCount;
+uint _DispatchThreadsX;
+uint _PushGridSize;
+uint _PushGridMask;
+uint _PushUseCloneBounds;
+uint _ComposedCount;
+uint _ComposedChildCount;
+uint _ComposedParentSource;
+uint _ComposedBucketBase;
+uint _ComposedCapacity;
+uint _ComposedVisibleOffset;
+uint _NestedSourceCount;
+uint _NestedSourceOrder;
+uint _NestedSeed;
+float4 _NestedRootInvRotation;
+float3 _NestedRootPosition;
+float3 _NestedRootInvScale;
+int3 _GridCount;
+float3 _GridSpacing;
+float3 _LinearOffset;
+float3 _LinearRotation;
+float3 _LinearScale;
+float4x4 _MeshLocalToCloner;
+float4x4 _MeshNormalToCloner;
+float4 _SplineParams; // x offset, y range start, z range end, w closed flag
+float3 _SplineUpLocal;
+uint _SplineSampleCount;
+float _RadialRadius;
+float _RadialRadiusStep;
+float2 _RadialArc;
+float _RadialRingTwist;
+float _RadialAxisStep;
+float2 _RadialSpiral;
+float4 _RadialWave;
+float _RadialWaveAxialPhase;
+float _RadialWaveRingPhase;
+float3 _RadialRotationOffset;
+float3 _RadialRotationStep;
+float _RadialScaleStep;
+float _RadialScaleWave;
+float _UniformScale;
+float3 _RootPosition;
+float4 _RootRotation;
+float3 _RootScale;
+float4 _FrustumPlanes[6];
+float3 _CameraPosition;
+float _TanHalfFov;
+float _OrthoSize;
+float _LodBias;
+float _MaxDrawDistance;
+float _BoundsPadding;
+float _PushExtraGap;
+uint _AppearanceHasPrevious;
+float _AppearanceInvDeltaTime;
+float _AppearanceSpeedBlend;
+
+uint flat_thread(uint3 id)
+{
+    return id.x + id.y * _DispatchThreadsX;
+}
+
+uint hash_u32(uint x)
+{
+    x ^= x >> 16u; x *= 0x7feb352du;
+    x ^= x >> 15u; x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+uint source_index_for_clone(uint index)
+{
+    uint sourceIndex = index % max(1u, _SourceCount);
+    if (_SourceOrder != 0u && _SourceCount > 1u)
+    {
+        uint group = index / _SourceCount;
+        sourceIndex = (sourceIndex + hash_u32(group ^ _Seed) % _SourceCount) % _SourceCount;
+    }
+    return sourceIndex;
+}
+
+uint nested_source_index_for_clone(uint index)
+{
+    uint sourceIndex = index % max(1u, _NestedSourceCount);
+    if (_NestedSourceOrder != 0u && _NestedSourceCount > 1u)
+    {
+        uint group = index / _NestedSourceCount;
+        sourceIndex = (sourceIndex + hash_u32(group ^ _NestedSeed) % _NestedSourceCount) % _NestedSourceCount;
+    }
+    return sourceIndex;
+}
+
+uint hash_push_cell(int3 cell)
+{
+    uint hash = hash_u32(asuint(cell.x) * 73856093u ^
+                         asuint(cell.y) * 19349663u ^
+                         asuint(cell.z) * 83492791u);
+    return hash & _PushGridMask;
+}
+
+float push_cell_size()
+{
+    float maximumRadius = _PushUseCloneBounds != 0u ? asfloat(_PushMaxRadius[0]) : 0.0;
+    return max(1e-4, maximumRadius * 2.0 + max(0.0, _PushExtraGap) * 2.0);
+}
+
+float4 qmul(float4 a, float4 b)
+{
+    return float4(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz), a.w * b.w - dot(a.xyz, b.xyz));
+}
+
+float3 qrot(float4 q, float3 v)
+{
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+
+float4 euler_quat(float3 radians)
+{
+    float3 h = radians * 0.5;
+    float3 s, c; sincos(h, s, c);
+    float4 qx = float4(s.x, 0, 0, c.x);
+    float4 qy = float4(0, s.y, 0, c.y);
+    float4 qz = float4(0, 0, s.z, c.z);
+    return normalize(qmul(qz, qmul(qy, qx)));
+}
+
+float3 safe_normalize(float3 value, float3 fallback)
+{
+    float magnitudeSq = dot(value, value);
+    return magnitudeSq > 1e-10 ? value * rsqrt(magnitudeSq) : fallback;
+}
+
+float4 quat_from_basis(float3 right, float3 up, float3 forward)
+{
+    float m00 = right.x, m01 = up.x, m02 = forward.x;
+    float m10 = right.y, m11 = up.y, m12 = forward.y;
+    float m20 = right.z, m21 = up.z, m22 = forward.z;
+    float4 q;
+    float trace = m00 + m11 + m22;
+    if (trace > 0.0)
+    {
+        float s = sqrt(trace + 1.0) * 2.0;
+        q = float4((m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25 * s);
+    }
+    else if (m00 > m11 && m00 > m22)
+    {
+        float s = sqrt(max(1.0 + m00 - m11 - m22, 1e-8)) * 2.0;
+        q = float4(0.25 * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s);
+    }
+    else if (m11 > m22)
+    {
+        float s = sqrt(max(1.0 + m11 - m00 - m22, 1e-8)) * 2.0;
+        q = float4((m01 + m10) / s, 0.25 * s, (m12 + m21) / s, (m02 - m20) / s);
+    }
+    else
+    {
+        float s = sqrt(max(1.0 + m22 - m00 - m11, 1e-8)) * 2.0;
+        q = float4((m02 + m20) / s, (m12 + m21) / s, 0.25 * s, (m10 - m01) / s);
+    }
+    return normalize(q);
+}
+
+float4 alignment_axis_correction(uint axis)
+{
+    const float h = 0.707106781;
+    float4 correction = float4(0, 0, 0, 1);
+    if (axis == 1u) correction = float4(0, 1, 0, 0);       // -Z to +Z
+    else if (axis == 2u) correction = float4(h, 0, 0, h);  // +Y to +Z
+    else if (axis == 3u) correction = float4(-h, 0, 0, h); // -Y to +Z
+    else if (axis == 4u) correction = float4(0, -h, 0, h); // +X to +Z
+    else if (axis == 5u) correction = float4(0, h, 0, h);  // -X to +Z
+    return correction;
+}
+
+float4 alignment_rotation(float3 direction, float3 automaticUp)
+{
+    direction = safe_normalize(direction, float3(0, 0, 1));
+    float3 up = automaticUp;
+    if (_AlignmentUp == 1u) up = float3(1, 0, 0);
+    else if (_AlignmentUp == 2u) up = float3(0, 1, 0);
+    else if (_AlignmentUp == 3u) up = float3(0, 0, 1);
+
+    up -= direction * dot(up, direction);
+    if (dot(up, up) <= 1e-8)
+    {
+        up = abs(direction.y) < 0.9 ? float3(0, 1, 0) : float3(0, 0, 1);
+        up -= direction * dot(up, direction);
+    }
+    up = safe_normalize(up, float3(0, 1, 0));
+    float3 right = safe_normalize(cross(up, direction), float3(1, 0, 0));
+    float3 stableUp = cross(direction, right);
+    return normalize(qmul(quat_from_basis(right, stableUp, direction),
+                          alignment_axis_correction(_AlignmentAxis)));
+}
+
+uint radial_ring_size(uint ring)
+{
+    return max(1u, _RadialBaseCount + ring * _RadialCountStep);
+}
+
+uint radial_ring_start(uint ring)
+{
+    uint result = 0u;
+    if (ring > 0u)
+    {
+        uint pairs = (ring & 1u) == 0u ? (ring / 2u) * (ring - 1u) : ring * ((ring - 1u) / 2u);
+        result = ring * _RadialBaseCount + pairs * _RadialCountStep;
+    }
+    return result;
+}
+
+void radial_decode(uint index, out uint ring, out uint segment, out uint segments, out uint start)
+{
+    ring = 0u;
+    if (_RadialCountStep == 0u)
+    {
+        ring = min(index / max(1u, _RadialBaseCount), max(1u, _RadialRingCount) - 1u);
+    }
+    else
+    {
+        float stepValue = float(_RadialCountStep);
+        float linearValue = float(_RadialBaseCount) - stepValue * 0.5;
+        float root = (-linearValue + sqrt(max(0.0, linearValue * linearValue + 2.0 * stepValue * float(index)))) / stepValue;
+        ring = min((uint)floor(max(0.0, root)), max(1u, _RadialRingCount) - 1u);
+        uint estimatedStart = radial_ring_start(ring);
+        if (estimatedStart > index && ring > 0u) ring--;
+        else if (ring + 1u < _RadialRingCount && radial_ring_start(ring + 1u) <= index) ring++;
+    }
+    start = radial_ring_start(ring);
+    segments = radial_ring_size(ring);
+    segment = min(index - start, segments - 1u);
+}
+
+bool radial_arc_closed()
+{
+    return abs(abs(_RadialArc.y - _RadialArc.x) - 6.28318530718) <= 0.0002;
+}
+
+float radial_path_u(uint segment, uint segments, bool closed)
+{
+    float result = 0.0;
+    if (segments > 1u)
+        result = closed ? float(segment) / float(segments) : float(segment) / float(segments - 1u);
+    return result;
+}
+
+uint radial_segment_at_u(float u, uint segments, bool closed)
+{
+    uint result = 0u;
+    if (segments > 1u)
+    {
+        result = closed ? (uint)round(saturate(u) * float(segments)) % segments
+                        : min((uint)round(saturate(u) * float(segments - 1u)), segments - 1u);
+    }
+    return result;
+}
+
+void radial_transform(uint ring, float u, out float3 position, out float3 pathDirection,
+                      out float3 outwardDirection, out float3 automaticUp, out float wavePhase)
+{
+    float angle = lerp(_RadialArc.x, _RadialArc.y, u) + float(ring) * _RadialRingTwist;
+    wavePhase = u * _RadialWave.z * 6.28318530718 + _RadialWave.w + float(ring) * _RadialWaveRingPhase;
+    float radius = _RadialRadius + float(ring) * _RadialRadiusStep + u * _RadialSpiral.x
+                 + sin(wavePhase) * _RadialWave.x;
+    float ringCoordinate = _RadialCenterAxis != 0u
+        ? float(ring) - (float(max(1u, _RadialRingCount)) - 1.0) * 0.5 : float(ring);
+    float pathCoordinate = _RadialCenterAxis != 0u ? u - 0.5 : u;
+    float axisPosition = ringCoordinate * _RadialAxisStep + pathCoordinate * _RadialSpiral.y
+                       + sin(wavePhase + _RadialWaveAxialPhase) * _RadialWave.y;
+
+    float angleDerivative = _RadialArc.y - _RadialArc.x;
+    float waveDerivative = _RadialWave.z * 6.28318530718;
+    float radiusDerivative = _RadialSpiral.x + cos(wavePhase) * waveDerivative * _RadialWave.x;
+    float axisDerivative = _RadialSpiral.y
+        + cos(wavePhase + _RadialWaveAxialPhase) * waveDerivative * _RadialWave.y;
+    float s, c; sincos(angle, s, c);
+    float radialX = c * radius;
+    float radialY = s * radius;
+    float tangentX = c * radiusDerivative - s * radius * angleDerivative;
+    float tangentY = s * radiusDerivative + c * radius * angleDerivative;
+
+    if (_RadialPlane == 0u)
+    {
+        position = float3(radialX, radialY, axisPosition);
+        pathDirection = float3(tangentX, tangentY, axisDerivative);
+        outwardDirection = float3(radialX, radialY, 0);
+        automaticUp = float3(0, 0, 1);
+    }
+    else if (_RadialPlane == 1u)
+    {
+        position = float3(radialX, axisPosition, radialY);
+        pathDirection = float3(tangentX, axisDerivative, tangentY);
+        outwardDirection = float3(radialX, 0, radialY);
+        automaticUp = float3(0, 1, 0);
+    }
+    else
+    {
+        position = float3(axisPosition, radialX, radialY);
+        pathDirection = float3(axisDerivative, tangentX, tangentY);
+        outwardDirection = float3(0, radialX, radialY);
+        automaticUp = float3(1, 0, 0);
+    }
+}
+
+void distribution_transform(uint index, out float3 position, out float4 rotation, out float3 scale)
+{
+    position = 0;
+    rotation = float4(0, 0, 0, 1);
+    scale = 1;
+    float3 pathDirection = float3(0, 0, 1);
+    float3 outwardDirection = pathDirection;
+    float3 automaticUp = float3(0, 1, 0);
+    float4 layoutRotation = float4(0, 0, 0, 1);
+    if (_Distribution == 0u)
+    {
+        uint gx = index % (uint)_GridCount.x;
+        uint gy = (index / (uint)_GridCount.x) % (uint)_GridCount.y;
+        uint gz = index / (uint)(_GridCount.x * _GridCount.y);
+        float3 grid = float3(gx, gy, gz);
+        float3 gridCentre = (float3(_GridCount) - 1.0) * _GridSpacing * 0.5;
+        position = grid * _GridSpacing;
+        if (_Center != 0u) position -= gridCentre;
+        outwardDirection = grid * _GridSpacing - gridCentre;
+        if (_GridCount.x > 1 && abs(_GridSpacing.x) > 1e-6) pathDirection = float3(sign(_GridSpacing.x), 0, 0);
+        else if (_GridCount.y > 1 && abs(_GridSpacing.y) > 1e-6) pathDirection = float3(0, sign(_GridSpacing.y), 0);
+        else if (_GridCount.z > 1 && abs(_GridSpacing.z) > 1e-6) pathDirection = float3(0, 0, sign(_GridSpacing.z));
+    }
+    else if (_Distribution == 1u)
+    {
+        float u = _InstanceCount > 1u ? float(index) / float(_InstanceCount - 1u) : 0.0;
+        position = _LinearOffset * float(index);
+        pathDirection = safe_normalize(_LinearOffset, float3(0, 0, 1));
+        outwardDirection = position - _LinearOffset * float(max(1u, _InstanceCount) - 1u) * 0.5;
+        layoutRotation = euler_quat(_LinearRotation * float(index));
+        scale = lerp(1.0.xxx, _LinearScale, u);
+    }
+    else if (_Distribution == 2u)
+    {
+        uint ring, segment, segments, start;
+        radial_decode(index, ring, segment, segments, start);
+        bool closed = radial_arc_closed();
+        float u = radial_path_u(segment, segments, closed);
+        float wavePhase;
+        radial_transform(ring, u, position, pathDirection, outwardDirection, automaticUp, wavePhase);
+        layoutRotation = euler_quat(_RadialRotationOffset + float(ring) * _RadialRotationStep);
+        scale *= max(0.001, 1.0 + float(ring) * _RadialScaleStep + sin(wavePhase) * _RadialScaleWave);
+    }
+    else if (_Distribution == 3u)
+    {
+        MeshSample sample = _MeshSamples[index];
+        position = mul(_MeshLocalToCloner, float4(sample.position, 1.0)).xyz;
+        float3 surfaceNormal = safe_normalize(
+            mul((float3x3)_MeshNormalToCloner, sample.normal), float3(0, 1, 0));
+        float3 helper = abs(surfaceNormal.y) < 0.999 ? float3(0, 1, 0) : float3(1, 0, 0);
+        pathDirection = safe_normalize(cross(helper, surfaceNormal), float3(1, 0, 0));
+        outwardDirection = surfaceNormal;
+        automaticUp = surfaceNormal;
+    }
+    else
+    {
+        // Spline: an arc-length-uniform LUT baked from the Braze Spline in its local space. Count,
+        // range, and offset are uniforms interpolated here, so animating them never rebakes the LUT.
+        uint lutCount = max(2u, _SplineSampleCount);
+        float span = _SplineParams.z - _SplineParams.y;
+        bool splineClosed = _SplineParams.w > 0.5;
+        bool fullLoop = splineClosed && abs(abs(span) - 1.0) <= 1e-4;
+        float denominator = fullLoop ? float(max(1u, _InstanceCount)) : float(max(1u, _InstanceCount - 1u));
+        float pathU = _InstanceCount > 1u ? float(index) / denominator : 0.0;
+        float u = _SplineParams.y + pathU * span + _SplineParams.x;
+        u = splineClosed ? frac(u) : saturate(u);
+        float x = u * float(lutCount - 1u);
+        uint sample0 = min((uint)x, lutCount - 2u);
+        float blend = saturate(x - float(sample0));
+        MeshSample a = _MeshSamples[sample0];
+        MeshSample b = _MeshSamples[sample0 + 1u];
+        float3 localPosition = lerp(a.position, b.position, blend);
+        float3 localTangent = safe_normalize(lerp(a.normal, b.normal, blend), a.normal);
+        position = mul(_MeshLocalToCloner, float4(localPosition, 1.0)).xyz;
+        pathDirection = safe_normalize(mul((float3x3)_MeshLocalToCloner, localTangent), float3(0, 0, 1));
+        automaticUp = safe_normalize(mul((float3x3)_MeshNormalToCloner, _SplineUpLocal), float3(0, 1, 0));
+        outwardDirection = safe_normalize(cross(pathDirection, automaticUp), automaticUp);
+    }
+
+    uint resolvedAlignment = _Alignment == 0u
+        ? (_Distribution == 2u || _Distribution == 4u ? 2u : (_Distribution == 3u ? 3u : 1u))
+        : _Alignment;
+    if (resolvedAlignment != 1u)
+    {
+        float3 direction = resolvedAlignment == 2u ? pathDirection : outwardDirection;
+        if (resolvedAlignment == 4u) direction = -direction;
+        direction = safe_normalize(direction, pathDirection);
+        rotation = alignment_rotation(direction, automaticUp);
+    }
+    rotation = normalize(qmul(rotation, layoutRotation));
+    scale *= _UniformScale;
+}
+
+[numthreads(THREADS, 1, 1)]
+void BuildClones(uint3 id : SV_DispatchThreadID)
+{
+    uint index = flat_thread(id);
+    if (index >= _InstanceCount) return;
+    float3 position, scale;
+    float4 rotation;
+    distribution_transform(index, position, rotation, scale);
+    position = _RootPosition + qrot(_RootRotation, position * _RootScale);
+    rotation = normalize(qmul(_RootRotation, rotation));
+    scale *= abs(_RootScale);
+    _BasePosition[index] = float4(position, 1.0);
+    _BaseRotation[index] = rotation;
+    _BaseScale[index] = float4(scale, 0.0);
+}
+
+[numthreads(THREADS, 1, 1)]
+void MeasureCloneSpeed(uint3 id : SV_DispatchThreadID)
+{
+    uint index = flat_thread(id);
+    if (index >= _InstanceCount) return;
+    float3 position = _BasePositionRead[index].xyz + _EffectorPositionRead[index].xyz;
+    float speed = _AppearanceHasPrevious != 0u
+        ? length(position - _AppearancePreviousPosition[index].xyz) * _AppearanceInvDeltaTime
+        : 0.0;
+    _AppearanceSpeed[index] = _AppearanceHasPrevious != 0u
+        ? lerp(_AppearanceSpeed[index], speed, saturate(_AppearanceSpeedBlend))
+        : 0.0;
+    _AppearancePreviousPosition[index] = float4(position, 1.0);
+}
+
+[numthreads(THREADS, 1, 1)]
+void ClearBuckets(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _BucketCount) _BucketCounts[id.x] = 0u;
+}
+
+// Returns the selected LOD, or -1 when the instance is culled. Single exit with an initialized result:
+// Metal's conservative analysis flags both out parameters and early returns inside unrolled loops as
+// potentially uninitialized (same pattern as push_correction).
+int cull_select_lod(float3 position, float scaleMax, CloneSource source)
+{
+    int result = -1;
+    float radius = source.radius * scaleMax + _BoundsPadding;
+
+    bool visible = true;
+    [unroll] for (uint plane = 0u; plane < 6u; plane++)
+        visible = visible && dot(_FrustumPlanes[plane].xyz, position) + _FrustumPlanes[plane].w >= -radius;
+
+    float distanceToCamera = distance(position, _CameraPosition);
+    if (_MaxDrawDistance > 0.0 && distanceToCamera - radius > _MaxDrawDistance) visible = false;
+    if (visible)
+    {
+        float relativeHeight = _Orthographic != 0u
+            ? radius / max(_OrthoSize, 1e-4)
+            : radius / max(distanceToCamera * max(_TanHalfFov, 1e-4), 1e-4);
+        relativeHeight *= max(_LodBias, 0.01);
+        uint lastLod = max(1u, min(source.lodCount, (uint)MAX_LODS)) - 1u;
+        uint lod = lastLod;
+        if (lastLod > 0u && relativeHeight >= source.thresholds.x) lod = 0u;
+        else if (lastLod > 1u && relativeHeight >= source.thresholds.y) lod = 1u;
+        else if (lastLod > 2u && relativeHeight >= source.thresholds.z) lod = 2u;
+        result = (int)lod;
+    }
+    return result;
+}
+
+[numthreads(THREADS, 1, 1)]
+void CullAndBucket(uint3 id : SV_DispatchThreadID)
+{
+    uint index = flat_thread(id);
+    if (index >= _InstanceCount || _SourceCount == 0u) return;
+    uint sourceIndex = source_index_for_clone(index);
+    CloneSource source = _Sources[sourceIndex];
+    float3 position = _BasePositionRead[index].xyz + _EffectorPositionRead[index].xyz;
+    float3 scale = abs(_BaseScaleRead[index].xyz * _EffectorScaleRead[index].xyz);
+    int lod = cull_select_lod(position, max(scale.x, max(scale.y, scale.z)), source);
+    if (lod < 0) return;
+    uint bucket = sourceIndex * MAX_LODS + (uint)lod;
+    uint slot;
+    InterlockedAdd(_BucketCounts[bucket], 1u, slot);
+    if (slot < _SourceCapacity) _VisibleIndices[bucket * _SourceCapacity + slot] = index;
+}
+
+// One thread per (parent clone, child clone) pair. The child cloner's transform stream is composed with the
+// parent's on the fly: no composed transforms are ever stored, so a nested child adds no per-frame prepare
+// cost beyond this cull. The composed index is decoded again by the vertex shader with the same layout.
+[numthreads(THREADS, 1, 1)]
+void CullAndBucketComposed(uint3 id : SV_DispatchThreadID)
+{
+    uint index = flat_thread(id);
+    if (index >= _ComposedCount || _NestedSourceCount == 0u) return;
+    uint childCount = max(1u, _ComposedChildCount);
+    uint parentIndex = index / childCount;
+    uint childIndex = index - parentIndex * childCount;
+    if (source_index_for_clone(parentIndex) != _ComposedParentSource) return;
+
+    uint childSourceIndex = nested_source_index_for_clone(childIndex);
+    CloneSource source = _NestedSources[childSourceIndex];
+
+    float3 parentPosition = _BasePositionRead[parentIndex].xyz + _EffectorPositionRead[parentIndex].xyz;
+    float4 parentRotation = normalize(qmul(_EffectorRotationRead[parentIndex], _BaseRotationRead[parentIndex]));
+    float3 parentScale = _BaseScaleRead[parentIndex].xyz * _EffectorScaleRead[parentIndex].xyz;
+    float3 childPosition = _NestedBasePosition[childIndex].xyz + _NestedEffectorPosition[childIndex].xyz;
+    float3 childScale = _NestedBaseScale[childIndex].xyz * _NestedEffectorScale[childIndex].xyz;
+
+    float3 relativePosition = qrot(_NestedRootInvRotation, childPosition - _NestedRootPosition) * _NestedRootInvScale;
+    float3 position = parentPosition + qrot(parentRotation, relativePosition * parentScale);
+    float3 scale = abs(parentScale * _NestedRootInvScale * childScale);
+    int lod = cull_select_lod(position, max(scale.x, max(scale.y, scale.z)), source);
+    if (lod < 0) return;
+    uint localBucket = childSourceIndex * MAX_LODS + (uint)lod;
+    uint slot;
+    InterlockedAdd(_BucketCounts[_ComposedBucketBase + localBucket], 1u, slot);
+    if (slot < _ComposedCapacity)
+        _VisibleIndices[_ComposedVisibleOffset + localBucket * _ComposedCapacity + slot] = index;
+}
+
+[numthreads(1, 1, 1)]
+void ClearPushApartRadius(uint3 id : SV_DispatchThreadID)
+{
+    _PushMaxRadius[0] = 0u;
+}
+
+[numthreads(THREADS, 1, 1)]
+void MeasurePushApartRadius(uint3 id : SV_DispatchThreadID)
+{
+    uint index = flat_thread(id);
+    if (index >= _InstanceCount || _SourceCount == 0u) return;
+    float radius = 0.0;
+    if (_PushUseCloneBounds != 0u)
+    {
+        CloneSource source = _Sources[source_index_for_clone(index)];
+        float3 scale = abs(_BaseScaleRead[index].xyz * _EffectorScaleRead[index].xyz);
+        radius = source.radius * max(scale.x, max(scale.y, scale.z));
+    }
+    _PushRadii[index] = radius;
+    InterlockedMax(_PushMaxRadius[0], asuint(radius));
+}
+
+[numthreads(THREADS, 1, 1)]
+void ClearPushApartGrid(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _PushGridSize) _PushGridHeads[id.x] = -1;
+}
+
+[numthreads(THREADS, 1, 1)]
+void BuildPushApartGrid(uint3 id : SV_DispatchThreadID)
+{
+    uint index = flat_thread(id);
+    if (index >= _InstanceCount) return;
+    float3 position = _BasePositionRead[index].xyz + _EffectorPositionRead[index].xyz;
+    int3 cell = (int3)floor(position / push_cell_size());
+    uint bucket = hash_push_cell(cell);
+    int previous;
+    InterlockedExchange(_PushGridHeads[bucket], (int)index, previous);
+    _PushGridNext[index] = previous;
+    _PushGridCells[index] = int4(cell, 0);
+}
+
+[numthreads(THREADS, 1, 1)]
+void CapturePushApartBakeInput(uint3 id : SV_DispatchThreadID)
+{
+    uint index = flat_thread(id);
+    if (index >= _InstanceCount) return;
+    _PushInputPosition[index] = _EffectorPositionRead[index];
+}
+
+[numthreads(THREADS, 1, 1)]
+void ApplyPushApartBake(uint3 id : SV_DispatchThreadID)
+{
+    uint index = flat_thread(id);
+    if (index >= _InstanceCount) return;
+    float4 input = _EffectorPositionRead[index];
+    _EffectorPositionWrite[index] = float4(input.xyz + _PushBakeRead[index].xyz, input.w);
+}
+
+[numthreads(THREADS, 1, 1)]
+void WriteDrawArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint draw = id.x;
+    if (draw >= _DrawCount) return;
+    IndirectArgs args = _DrawArgs[draw];
+    uint2 bucketAndCapacity = _DrawBuckets[draw];
+    args.instanceCount = min(_BucketCountsRead[bucketAndCapacity.x], bucketAndCapacity.y);
+    _DrawArgs[draw] = args;
+}
+
+float effector_shape_distance(GpuFractureEffector e, float3 p, uint shape)
+{
+    const float epsilon = 1e-5;
+    float result = 0.0;
+    if (shape == 1u)
+    {
+        result = distance(p, e.position) / max(e.radius, epsilon);
+    }
+    else
+    {
+        float4 invQ = float4(-e.rotation.xyz, e.rotation.w);
+        float3 lp = qrot(invQ, p - e.position);
+        if (shape == 2u || shape == 7u)
+        {
+            result = max(max(abs(lp.x) / max(e.boxHalf.x, epsilon),
+                             abs(lp.y) / max(e.boxHalf.y, epsilon)),
+                             abs(lp.z) / max(e.boxHalf.z, epsilon));
+        }
+        else if (shape == 3u)
+        {
+            float capsuleRadius = max(e.radius, epsilon);
+            float halfHeight = max(e.boxHalf.y, capsuleRadius);
+            float segment = max(halfHeight - capsuleRadius, 0.0);
+            float3 capsulePoint = float3(lp.x, max(abs(lp.y) - segment, 0.0), lp.z);
+            result = length(capsulePoint) / capsuleRadius;
+        }
+        else if (shape == 4u)
+        {
+            float radial = length(lp.xz) / max(e.radius, epsilon);
+            float vertical = abs(lp.y) / max(e.boxHalf.y, epsilon);
+            result = max(radial, vertical);
+        }
+        else if (shape == 5u)
+        {
+            float halfHeight = max(e.boxHalf.y, epsilon);
+            float height01 = saturate((lp.y + halfHeight) / (2.0 * halfHeight));
+            float availableRadius = max(e.radius * (1.0 - height01), epsilon);
+            float radial = length(lp.xz) / availableRadius;
+            float vertical = abs(lp.y) / halfHeight;
+            result = max(radial, vertical);
+        }
+        else if (shape == 6u)
+        {
+            float tubeDistance = length(float2(length(lp.xz) - e.radius, lp.y));
+            result = tubeDistance / max(e.boxHalf.x, epsilon);
+        }
+    }
+    return result;
+}
+
+float effector_weight(GpuFractureEffector e, float3 p)
+{
+    uint shape = (uint)round(e.shape);
+    float result = e.strength;
+    float t = 0.0;
+    if (shape != 0u) t = effector_shape_distance(e, p, shape);
+    if (shape != 0u)
+    {
+        float x = saturate(t) * 255.0;
+        uint x0 = (uint)floor(x), x1 = min(x0 + 1u, 255u);
+        uint row = (uint)max(e.falloffRow, 0.0) * 256u;
+        result = t > 1.0 ? 0.0 : lerp(_EffectorFalloff[row + x0], _EffectorFalloff[row + x1], frac(x)) * e.strength;
+    }
+    return result;
+}
+
+float3 pair_direction(uint self, uint other)
+{
+    uint lo = min(self, other), hi = max(self, other);
+    uint h = hash_u32(lo * 0x9e3779b9u ^ hi * 0x85ebca6bu);
+    float3 direction = float3(float(h & 1023u), float((h >> 10) & 1023u), float((h >> 20) & 1023u));
+    direction = direction / 511.5 - 1.0;
+    if (dot(direction, direction) <= 1e-6) direction = float3(1, 0, 0);
+    direction = normalize(direction);
+    return self < other ? -direction : direction;
+}
+
+// xyz is the correction, w is 1 when the pair overlaps. Returning one fully initialized value avoids Metal's
+// conservative out-parameter analysis warning while preserving the exact separation math.
+float4 push_correction(float3 difference, float minimumDistance, int mode, uint self, uint other)
+{
+    float4 result = float4(0, 0, 0, 0);
+    // Prevent sub-pixel penetration noise from changing the correction set every frame.
+    float contactSlop = max(1e-4, minimumDistance * 0.002);
+    if (mode == 0)
+    {
+        float d = length(difference);
+        float penetration = minimumDistance - d;
+        if (penetration > contactSlop)
+        {
+            float3 direction = d > 1e-6 ? difference / d : pair_direction(self, other);
+            result = float4(direction * (penetration - contactSlop), 1);
+        }
+    }
+    else
+    {
+        float component = mode == 1 ? difference.x : mode == 2 ? difference.y : difference.z;
+        float perpendicularSq = max(0.0, dot(difference, difference) - component * component);
+        float overlap = sqrt(max(0.0, minimumDistance * minimumDistance - perpendicularSq)) - abs(component);
+        if (overlap > contactSlop)
+        {
+            float signedOverlap = (overlap - contactSlop) *
+                (abs(component) > 1e-6 ? sign(component) : (self < other ? -1.0 : 1.0));
+            float3 correction = mode == 1 ? float3(signedOverlap, 0, 0)
+                              : mode == 2 ? float3(0, signedOverlap, 0)
+                                          : float3(0, 0, signedOverlap);
+            result = float4(correction, 1);
+        }
+    }
+    return result;
+}
+
+[numthreads(THREADS, 1, 1)]
+void PushApart(uint3 id : SV_DispatchThreadID)
+{
+    uint index = flat_thread(id);
+    if (index >= _InstanceCount || _EffectorIndex >= _EffectorCount) return;
+    GpuFractureEffector e = _Effectors[_EffectorIndex];
+    float4 currentData = _EffectorPositionRead[index];
+    float3 current = currentData.xyz;
+    float3 selfPosition = _BasePositionRead[index].xyz + current;
+    float weight = effector_weight(e, selfPosition);
+    float authoredDistance = max(0.0, e.parameters.x) * 2.0;
+    float maximumDistance = authoredDistance;
+    float3 delta = 0;
+    float overlapCount = 0.0;
+    if (abs(weight) > 1e-6 && push_cell_size() > 0.0)
+    {
+        int3 selfCell = _PushGridCells[index].xyz;
+        uint visited = 0u;
+        for (int z = -1; z <= 1 && visited < MAX_PUSH_CANDIDATES; z++)
+        for (int y = -1; y <= 1 && visited < MAX_PUSH_CANDIDATES; y++)
+        for (int x = -1; x <= 1 && visited < MAX_PUSH_CANDIDATES; x++)
+        {
+            int3 queryCell = selfCell + int3(x, y, z);
+            int candidate = _PushGridHeads[hash_push_cell(queryCell)];
+            while (candidate >= 0 && visited < MAX_PUSH_CANDIDATES)
+            {
+                uint other = (uint)candidate;
+                candidate = _PushGridNext[other];
+                visited++;
+                if (other == index || any(_PushGridCells[other].xyz != queryCell)) continue;
+                float minimumDistance = _PushUseCloneBounds != 0u
+                    ? _PushRadii[index] + _PushRadii[other] + authoredDistance
+                    : authoredDistance;
+                if (minimumDistance <= 0.0) continue;
+                maximumDistance = max(maximumDistance, minimumDistance);
+                float3 otherPosition = _BasePositionRead[other].xyz + _EffectorPositionRead[other].xyz;
+                float4 correction = push_correction(selfPosition - otherPosition, minimumDistance, e.mode, index, other);
+                if (correction.w < 0.5) continue;
+                bool otherMoves = abs(effector_weight(e, otherPosition)) > 1e-6;
+                delta += correction.xyz * (otherMoves ? 0.5 : 1.0);
+                overlapCount += 1.0;
+            }
+        }
+        // Summed penetrations make dense groups overshoot and reverse on the next pass. The relaxed contact
+        // average converges without oscillation and is insensitive to hash-list insertion order.
+        if (overlapCount > 0.0) delta *= weight * 0.9 / overlapCount;
+        float lengthDelta = length(delta);
+        if (lengthDelta > maximumDistance) delta *= maximumDistance / lengthDelta;
+    }
+    _EffectorPositionWrite[index] = float4(current + delta, max(currentData.w, abs(weight)));
+}
+
+[numthreads(THREADS, 1, 1)]
+void StorePushApartBake(uint3 id : SV_DispatchThreadID)
+{
+    uint index = flat_thread(id);
+    if (index >= _InstanceCount) return;
+    float3 correction = _EffectorPositionRead[index].xyz - _PushInputPosition[index].xyz;
+    _PushBakeWrite[index] = float4(correction, 0.0);
+}

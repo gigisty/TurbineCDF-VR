@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: 1006933aed96643a5aa67a70ac5f595f
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 2100000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Z-Demo Assets/Materials/Wood B.mat
+  uploadId: 959622

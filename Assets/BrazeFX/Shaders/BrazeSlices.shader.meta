@@ -1,0 +1,16 @@
+fileFormatVersion: 2
+guid: 712a837b982054deeb38b35cfd52128e
+ShaderImporter:
+  externalObjects: {}
+  defaultTextures: []
+  nonModifiableTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Shaders/BrazeSlices.shader
+  uploadId: 959622

@@ -1,0 +1,299 @@
+// BrazeFX VDB playback reconstruction
+//
+// OpenVDB interchange carries renderer scalars, not a simulation velocity field. This compute reconstructs a
+// deterministic visual motion field from adjacent scalar frames. It is deliberately renderer-only: the result feeds
+// temporal reprojection and Render Detail, never pressure, combustion, or the cached scalar data.
+//
+// The solve is a coarse-to-fine (3-level) Horn–Schunck pyramid with warped re-linearization: linearized optical
+// flow can only measure sub-voxel to ~1-voxel displacement, so fast plume motion is first captured at quarter
+// resolution (where it IS sub-voxel), then each finer level warps the neighbour frame by the upsampled estimate
+// and solves only the residual. That keeps reconstructed magnitude close to the true motion instead of the
+// systematic underestimate a single-scale solve produces on anything faster than a voxel per frame.
+
+#pragma kernel PackSignalPair
+#pragma kernel DownsampleSignal
+#pragma kernel BuildMotionTerms
+#pragma kernel RefineMotion
+#pragma kernel TemporalBlendMotion
+#pragma kernel FinalizeMotion
+
+SamplerState samplerLinearClamp;
+
+Texture3D<float4> _CurrentState;       // density, temperature, fuel(0), emission/burn
+Texture3D<float4> _NeighbourState;
+Texture3D<float4> _SignalPair;         // r = current signal, g = neighbour signal, b = content mask source
+Texture3D<float4> _MotionTerms;        // xyz = effective spatial gradient, w = warped temporal residual
+Texture3D<float4> _MotionRead;         // xyz = voxels/frame at the current level, w = confidence/content mask
+Texture3D<float4> _MotionSeed;         // coarser level's solved motion (in ITS voxel units)
+Texture3D<float4> _MotionHistory;      // previous frame's UNFADED motion (full-res voxels/frame, w = reliability)
+
+RWTexture3D<float4> _SignalWrite;
+RWTexture3D<float4> _MotionTermsWrite;
+RWTexture3D<float4> _MotionWrite;
+RWTexture3D<float4> _MotionHistoryWrite;
+RWTexture3D<float4> _VelocityWrite;    // xyz = voxels/second, w = confidence
+RWTexture3D<float4> _FlowWrite;        // xyz = UVW displacement anchor
+RWTexture3D<float4> _CurlWrite;        // xyz = visual vorticity
+
+int3 _VdbRes;                          // resolution of the level being processed
+int3 _FullRes;                         // full-resolution grid (history and renderer output space)
+int3 _SrcRes;                          // downsample source resolution
+int3 _MotionRes;                       // FinalizeMotion: resolution of _MotionRead (the finest SOLVED level)
+float _MotionScale;                    // FinalizeMotion: full-res voxels per motion voxel (1 full solve, 2 half)
+float _LevelScale;                     // full-res voxels per voxel of this level (1, 2, 4)
+int _SeedMode;                         // 0 = none, 1 = seed texture (coarser level or same-level re-warp), 2 = advected temporal history
+float _SeedScale;                      // seed voxel units → this level's units (2 level-to-level, 1 re-warp)
+float _TemporalDirection;
+float _MotionSmoothness;
+float _MotionMaxVoxels;                // clamp in THIS level's voxels (full-res clamp / _LevelScale)
+float _MotionFps;
+float _FlowMemoryFrames;
+float _HistoryBlend;                   // 0 on seeks/direction changes; settings.temporalSmoothing when sequential
+
+int3 ClampCoord(int3 p) { return clamp(p, int3(0, 0, 0), _VdbRes - 1); }
+
+float ScalarSignal(float4 s)
+{
+    // Log compression keeps a hot emission core from drowning the lower-density moving silhouette. Density remains
+    // authoritative; temperature and emission disambiguate motion inside a broad smoke body.
+    float density = log2(1.0 + max(s.x, 0.0) * 3.0);
+    float temperature = log2(1.0 + max(s.y, 0.0)) * 0.20;
+    float emission = log2(1.0 + max(s.w, 0.0) * 2.0) * 0.75;
+    return density + temperature + emission;
+}
+
+float3 ClampMotion(float3 v)
+{
+    float speed = length(v);
+    return speed > _MotionMaxVoxels ? v * (_MotionMaxVoxels / max(speed, 1e-5)) : v;
+}
+
+float4 SignalTap(int3 p) { return _SignalPair[ClampCoord(p)]; }
+
+float SampleNeighbourSignal(float3 voxel)
+{
+    return _SignalPair.SampleLevel(samplerLinearClamp, voxel / (float3)_VdbRes, 0).g;
+}
+
+float3 GradCurrent(int3 p)
+{
+    return 0.5 * float3(
+        SignalTap(p + int3(1, 0, 0)).r - SignalTap(p - int3(1, 0, 0)).r,
+        SignalTap(p + int3(0, 1, 0)).r - SignalTap(p - int3(0, 1, 0)).r,
+        SignalTap(p + int3(0, 0, 1)).r - SignalTap(p - int3(0, 0, 1)).r);
+}
+
+float3 GradNeighbourWarped(float3 q)
+{
+    return 0.5 * float3(
+        SampleNeighbourSignal(q + float3(1, 0, 0)) - SampleNeighbourSignal(q - float3(1, 0, 0)),
+        SampleNeighbourSignal(q + float3(0, 1, 0)) - SampleNeighbourSignal(q - float3(0, 1, 0)),
+        SampleNeighbourSignal(q + float3(0, 0, 1)) - SampleNeighbourSignal(q - float3(0, 0, 1)));
+}
+
+float4 SampleHistoryFull(float3 voxelFull)
+{
+    return _MotionHistory.SampleLevel(samplerLinearClamp, voxelFull / (float3)_FullRes, 0);
+}
+
+// The history vector belonging to the content now at this position was written where that content sat one stored
+// frame ago. One fixed-point back-trace with the history field itself recovers it; motion is always stored
+// forward-in-time, and history only ever engages during sequential forward stepping, so pos - h is the departure
+// point. Coordinates are full-res voxels — callers at coarse levels scale in and out by _LevelScale.
+float4 AdvectedHistoryFull(float3 centreFull)
+{
+    float4 carrier = SampleHistoryFull(centreFull);
+    return SampleHistoryFull(centreFull - carrier.xyz);
+}
+
+[numthreads(4, 4, 4)]
+void PackSignalPair(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VdbRes)) return;
+    int3 p = (int3)id;
+    float4 a = _CurrentState[p];
+    float4 b = _NeighbourState[p];
+    float content = max(max(a.x, b.x), max(max(a.y, b.y) * 0.25, max(a.w, b.w) * 0.5));
+    _SignalWrite[id] = float4(ScalarSignal(a), ScalarSignal(b), content, 0.0);
+}
+
+[numthreads(4, 4, 4)]
+void DownsampleSignal(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VdbRes)) return;   // _VdbRes = destination level, _SrcRes = finer source
+    int3 s = (int3)id * 2;
+    int3 hi = _SrcRes - 1;
+    float4 acc = 0.0;
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        int3 o = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        acc += _SignalPair[min(s + o, hi)];
+    }
+    _SignalWrite[id] = acc * 0.125;
+}
+
+// Level-generic term builder with warped linearization. The optical-flow constraint S_b(p + dir·v) = S_a(p) is
+// linearized around the seed w: sampling the neighbour at the warped point q = p + dir·w and solving
+// grad·v + dt = 0 with dt = (S_b(q) - S_a) - grad·w recovers the TOTAL motion, so RefineMotion runs unchanged.
+// This is what lets each finer level correct the coarse estimate instead of re-measuring displacement it cannot see.
+[numthreads(4, 4, 4)]
+void BuildMotionTerms(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VdbRes)) return;
+    int3 p = (int3)id;
+    float4 sp = SignalTap(p);
+    float sa = sp.r;
+    float mask = smoothstep(0.0005, 0.025, sp.b);
+
+    float3 w = 0.0;
+    float seedConfidence = 0.0;
+    if (_SeedMode == 1)
+    {
+        // Both textures span the same domain, so this level's normalized coordinate reads the seed trilinearly;
+        // _SeedScale converts the seed's voxel units to ours (2 for a coarser level, 1 for a same-level re-warp).
+        float4 seed = _MotionSeed.SampleLevel(samplerLinearClamp, ((float3)p + 0.5) / (float3)_VdbRes, 0);
+        w = ClampMotion(seed.xyz * _SeedScale);
+        seedConfidence = seed.w;
+    }
+    else if (_SeedMode == 2)
+    {
+        // Coarsest level, sequential playback: seed from the previous frame's advected motion. An under-converged
+        // solve keeps the shape of its seed wherever the data term is weak — exactly where independently seeded
+        // per-pair solves disagree frame to frame — while the warped data term still corrects toward this pair.
+        float3 centreFull = ((float3)p + 0.5) * _LevelScale;
+        float4 h = AdvectedHistoryFull(centreFull);
+        w = ClampMotion(h.xyz / _LevelScale) * (_HistoryBlend * saturate(h.w * 1.5));
+        seedConfidence = saturate(h.w * 1.5);
+    }
+
+    float dir = _TemporalDirection;
+    float3 q = (float3)p + 0.5 + w * dir;
+    float sbw = SampleNeighbourSignal(q);
+    float3 grad = dir * 0.5 * (GradCurrent(p) + GradNeighbourWarped(q));
+    float dt = (sbw - sa) - dot(grad, w);
+
+    float g2 = dot(grad, grad);
+    float alpha2 = _MotionSmoothness * _MotionSmoothness;
+    float3 initial = ClampMotion(w - (sbw - sa) * grad / max(g2 + alpha2, 1e-6)) * mask;
+    float confidence = mask * saturate(g2 / max(g2 + alpha2, 1e-6));
+    // Confidence continuity: the seed's confidence was diffused by a whole refine loop (coarser level or the
+    // first outer pass) — resetting it to the raw gradient measure here would starve plume interiors and let the
+    // downstream confidence fades eat their motion. Content-gated so empty space never inherits confidence.
+    confidence = max(confidence, seedConfidence * 0.96 * mask);
+    _MotionTermsWrite[id] = float4(grad, dt);
+    _MotionWrite[id] = float4(initial, confidence);
+}
+
+float4 ReadMotion(int3 p) { return _MotionRead[ClampCoord(p)]; }
+
+[numthreads(4, 4, 4)]
+void RefineMotion(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VdbRes)) return;
+    int3 p = (int3)id;
+    float4 centre = _MotionRead[p];
+    float4 neighbours =
+        ReadMotion(p + int3(1, 0, 0)) + ReadMotion(p - int3(1, 0, 0)) +
+        ReadMotion(p + int3(0, 1, 0)) + ReadMotion(p - int3(0, 1, 0)) +
+        ReadMotion(p + int3(0, 0, 1)) + ReadMotion(p - int3(0, 0, 1));
+    float3 average = neighbours.xyz * (1.0 / 6.0);
+    float4 terms = _MotionTerms[p];
+    float g2 = dot(terms.xyz, terms.xyz);
+    float alpha2 = _MotionSmoothness * _MotionSmoothness;
+    float correction = (dot(terms.xyz, average) + terms.w) / max(alpha2 + g2, 1e-6);
+    float3 solved = ClampMotion(average - terms.xyz * correction);
+
+    // Confidence is deliberately diffused farther than the scalar support. That fills the optical-flow aperture in
+    // broad plume interiors while a weak centre anchor prevents motion leaking indefinitely into empty space.
+    float confidence = max(centre.w, neighbours.w * (1.0 / 6.0) * 0.96);
+    float3 anchored = lerp(solved, centre.xyz, saturate(centre.w * 0.18));
+    // The leak gate must be CONTENT-gated, never applied inside visible smoke: this multiply runs every iteration,
+    // so a partial-confidence interior (smooth density, weak gradients) would decay geometrically — 0.36^4 ≈ 0.02
+    // after four passes — which is motion being eaten regardless of any slider. Inside content the diffused solve
+    // is the best motion available; only genuinely empty space decays leaked vectors.
+    float contentMask = smoothstep(0.0005, 0.025, SignalTap(p).b);
+    float keep = max(contentMask, smoothstep(0.002, 0.08, confidence));
+    _MotionWrite[id] = float4(anchored * keep, confidence);
+}
+
+// Exponential temporal blend against the previous frame's motion, advected into this frame. Runs at the finest
+// SOLVED level (motion in that level's voxel units; history is always full-res voxels — _LevelScale converts).
+// The weight is gated by history reliability and by agreement with the fresh solve: genuine accelerations and
+// topology changes deviate by voxels and break through, while estimation noise (sub-voxel disagreement between
+// adjacent independent solves) is averaged away. Runs only during sequential playback; seeks solve exactly as before.
+[numthreads(4, 4, 4)]
+void TemporalBlendMotion(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VdbRes)) return;
+    int3 p = (int3)id;
+    float4 m = _MotionRead[p];
+    float4 h = AdvectedHistoryFull(((float3)p + 0.5) * _LevelScale);
+    // FIXED voxel agreement scale (in full-res voxels), deliberately not tied to _MotionMaxVoxels: a raised travel
+    // clamp must widen what the solver can MEASURE, not how far history may disagree before losing its vote.
+    float agreement = smoothstep(2.5, 0.75, length(h.xyz - m.xyz * _LevelScale));
+    float w = _HistoryBlend * saturate(h.w * 1.5) * agreement;
+    // Where the fresh solve is confident it always keeps at least half its vote, whatever the smoothing slider
+    // says. Without this floor a high blend turns the output into self-advected history — a tiny detached
+    // advection sim whose structures transport and amplify until the agreement gate snaps them back.
+    w *= lerp(1.0, 0.5, saturate(m.w * 1.2));
+    // History also steadies confidence: reliability gates hovering at their fade thresholds are a per-frame
+    // pop source of their own, so a trusted history vote keeps them from flickering.
+    _MotionWrite[id] = float4(ClampMotion(lerp(m.xyz, h.xyz / _LevelScale, w)), max(m.w, h.w * w));
+}
+
+// FinalizeMotion runs at FULL res sampling the finest SOLVED level trilinearly (which may be half res — motion
+// fields are smooth, so solving them coarser than the scalar detail is visually near-lossless and is what keeps
+// playback cheap). Taps are spaced one full-res voxel apart and vectors are converted to full-res voxel units.
+float4 SampleMotionTex(float3 fullVoxel)
+{
+    return _MotionRead.SampleLevel(samplerLinearClamp, (fullVoxel / _MotionScale) / (float3)_MotionRes, 0);
+}
+
+[numthreads(4, 4, 4)]
+void FinalizeMotion(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VdbRes)) return;   // _VdbRes = full res here
+    int3 p = (int3)id;
+    float3 c = (float3)p + 0.5;
+    float4 m = SampleMotionTex(c);
+    float4 mx1 = SampleMotionTex(c + float3(1, 0, 0));
+    float4 mx0 = SampleMotionTex(c - float3(1, 0, 0));
+    float4 my1 = SampleMotionTex(c + float3(0, 1, 0));
+    float4 my0 = SampleMotionTex(c - float3(0, 1, 0));
+    float4 mz1 = SampleMotionTex(c + float3(0, 0, 1));
+    float4 mz0 = SampleMotionTex(c - float3(0, 0, 1));
+    float4 neighbourSum = mx1 + mx0 + my1 + my0 + mz1 + mz0;
+
+    // A pairwise optical-flow solve is trustworthy only when its support agrees locally. Use the same six taps the
+    // curl needs to remove isolated high-frequency vectors, then fade low-confidence motion instead of allowing it
+    // to move the renderer's detail/reprojection by several voxels. Spatial detail itself remains fully enabled.
+    float localConfidence = (m.w * 4.0 + neighbourSum.w) * 0.1;
+    float reliability = smoothstep(0.025, 0.20, min(m.w * 1.5, localConfidence));
+    // Same content floor as the refine gate: inside visible smoke the solve must move the renderer — fading it by
+    // gradient confidence freezes billow interiors, which reads as eaten motion. Empty space keeps the full fade.
+    float contentMask = smoothstep(0.0005, 0.025, SignalTap(p).b);
+    reliability = max(reliability, contentMask * 0.9);
+    // Centre-weighted 0.6/0.4 (was 0.4/0.6): full neighbour dominance was a second spatial low-pass on top of the
+    // solve's own regularizer and visibly flattened the smallest curl motion the pyramid works to preserve.
+    float3 vRaw = ClampMotion(lerp(neighbourSum.xyz * (1.0 / 6.0), m.xyz, 0.6) * _MotionScale);
+    float3 vFrame = vRaw * reliability;
+    float3 vSecond = vFrame * max(_MotionFps, 1.0);
+    float3 invRes = 1.0 / max((float3)_VdbRes, 1.0);
+    float3 flow = vFrame * _FlowMemoryFrames * invRes;
+
+    // Central differences over one full-res voxel; × _MotionScale converts the sampled vectors to full-res units.
+    float3 curl = 0.5 * _MotionScale * float3(
+        (my1.z - my0.z) - (mz1.y - mz0.y),
+        (mz1.x - mz0.x) - (mx1.z - mx0.z),
+        (mx1.y - mx0.y) - (my1.x - my0.x)) * reliability;
+
+    _VelocityWrite[id] = float4(vSecond, reliability);
+    _FlowWrite[id] = float4(flow, 0.0);
+    _CurlWrite[id] = float4(curl, 0.0);
+    // Persist the UNFADED motion: the reliability fade is an output conditioning step. Storing the faded vector
+    // would multiply the fade into the next frame's seed and blend, geometrically decaying interior motion toward
+    // zero across sequential playback — the "slower than truth" failure mode. The stored reliability still gates
+    // how much the next frame trusts this vector.
+    _MotionHistoryWrite[id] = float4(vRaw, reliability);
+}

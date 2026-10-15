@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: b56c5f52f90840ad81c91ea9d8bc6f0d
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Editor/Vdb/BrazeVdbCompression.cs
+  uploadId: 959622

@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 12223fdbd92e441e9910a42aca5d97d2
+DefaultImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Dynamic Volumetrics/Demo 2 - Smoke Vortex Moving.unity
+  uploadId: 959622

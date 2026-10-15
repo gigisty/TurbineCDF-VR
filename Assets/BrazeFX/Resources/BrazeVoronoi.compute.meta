@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 033fea0be8cee4a9ea3fa7daf9703113
+ComputeShaderImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Resources/BrazeVoronoi.compute
+  uploadId: 959622

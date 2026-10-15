@@ -1,0 +1,1070 @@
+// BrazeFX Surface Disintegrator - released-clump GPU simulation.
+// One thread per clump updates free chunks. Push/drag/orbit forces establish speed components first;
+// turbulence then bends that motion toward a curl-flow shape without adding speed.
+// Voronoi Fracture owns physical mass/radius + impact-fluid buffers. Surface Disintegrator deliberately uses the
+// lean variant: unit mass response, no fracture-only SRVs/UAVs, identical integration in the same single dispatch.
+#pragma kernel SimClumps BRAZE_FRACTURE_CLUMP_DATA
+#pragma kernel SimSurfaceClumps
+#pragma kernel MarkChunkedHits
+#pragma kernel ReleaseClumps
+#pragma kernel DebrisFromReleased
+#pragma kernel DebrisFromFreeClumps
+#pragma kernel CopyClumpHits
+#pragma kernel TagImpactFluid
+#pragma kernel ApplyFractureImpacts
+#pragma kernel RouteImpactsToIslands
+
+struct GpuForce
+{
+    float4 position;   // xyz position, w = type (0 wind, 1 radial, 2 vortex, 3 drag, 4 turbulence)
+    float4 direction;  // xyz wind dir / vortex axis, w = strength
+    float4 boxHalf;    // xyz box half-extents, w = sphere radius
+    float4 rot;        // region orientation (world quaternion)
+    float4 misc;       // x shape, y falloff row, z hold response / directional gravity tag, w vortex mode
+    float4 jitter;     // x = centre jitter, y = direction jitter, z = strength jitter, w = orbit radius (vortex)
+    float4 extra;      // turbulence: x = detail, y = scale (wave size), z = scale-random, w = unused
+};
+
+struct GpuCollider
+{
+    float4 center;    // xyz centre, w = shape (0 plane, 1 sphere, 2 box)
+    float4 normal;    // xyz plane normal, w = sphere radius
+    float4 extent;    // xyz box half-extents, w = unused
+    float4 rot;       // box orientation (world quaternion)
+    float4 response;  // x bounce, y friction, z strength, w _
+    float4 jitter;    // per-clump +/- fraction: x bounce, y friction, z strength, w unused
+};
+
+struct SpawnRequest
+{
+    float4 position;   // xyz spawn position, w = asfloat(flags)
+    float4 velocity;   // xyz source velocity
+    float4 color;      // reserved; emitter owns colour unless bit1 is set
+};
+
+RWStructuredBuffer<float4> _ClumpPosState;  // xyz world position, w state (0 anchored, 1 free)
+RWStructuredBuffer<float4> _ClumpRot;       // quaternion
+RWStructuredBuffer<float4> _ClumpLife;      // x scale, y dissolve, z speed, w age
+RWStructuredBuffer<float4> _ClumpVel;       // xyz velocity
+RWStructuredBuffer<float4> _ClumpAngVel;    // xyz angular velocity (rad/s)
+StructuredBuffer<uint2> _ClumpRange;        // x = shattered vertex start, y = count
+StructuredBuffer<uint2> _ShatteredIds;      // x = clump id, y = original vertex index
+
+StructuredBuffer<float3> _DeformedPos;      // current original vertex positions (world-space when _L2W is identity)
+StructuredBuffer<float3> _DeformedNrm;      // current original vertex normals
+RWStructuredBuffer<float3> _FreeOffset;     // captured world-space offset per shattered vertex
+RWStructuredBuffer<float3> _FreeNrm;        // captured world-space normal per shattered vertex
+RWStructuredBuffer<uint> _ClumpHit;         // set by BrazeDisintegrateHit.compute
+RWStructuredBuffer<uint> _ClumpHitBackup;   // used when one release event is fanned out to multiple debris emitters
+RWStructuredBuffer<float4> _ImpactFluidState; // xyz per-fragment channel rates, w remaining emission seconds
+RWStructuredBuffer<uint> _ImpactFluidMotion; // half2: low buoyancy, high fragment-velocity inheritance
+RWStructuredBuffer<float4> _ImpactFluidGeometry; // xyz local surface direction * bias, w authored duration
+RWStructuredBuffer<float4> _ImpactFluidVelocity; // xyz local ejecta velocity, w world-space breakup speed
+
+StructuredBuffer<float4> _ClumpPosStateRead;
+StructuredBuffer<float4> _ClumpRotRead;
+StructuredBuffer<float4> _ClumpLifeRead;
+StructuredBuffer<float4> _ClumpVelRead;
+StructuredBuffer<float4> _ClumpAngVelRead;
+StructuredBuffer<float> _ClumpMassRead;       // closed fragment volume / average fragment volume
+StructuredBuffer<float3> _FreeOffsetRead;
+StructuredBuffer<float3> _FreeNrmRead;
+
+RWStructuredBuffer<SpawnRequest> _DebrisRequests;
+RWStructuredBuffer<uint> _DebrisReqCount;
+uint _DebrisReqCapacity;
+uint _DebrisMaxRequests;
+uint _DebrisCount;
+float _DebrisRate;
+float _DebrisSpawnProbability; // per-emitter 0..1 multiplier; stochastic for integer burst requests
+uint _DebrisSpawnSalt;          // decorrelates fragment selection/surface samples between secondary emitters
+float _DebrisVelocityInherit;
+float _DebrisScatter;
+uint _DebrisAttach;   // 1 = spawn requests rigidly attach to their source clump (flags bit2 + clump index packed)
+float _DebrisSettleSpeed;   // a non-dissolving chunk slower than this stops shedding (0 = never gate; disintegrator)
+
+StructuredBuffer<GpuForce> _Forces;
+uint _ForceCount;
+StructuredBuffer<float> _ForceFalloff;   // forceCount × 256, flat (row*256 + col): each force's centre→edge curve
+float _TurbTime;                         // wall-clock time driving the turbulence curl field (keeps it "alive")
+
+StructuredBuffer<GpuCollider> _Colliders;
+uint _ColliderCount;
+
+uint  _ClumpCount;
+float _Dt;
+uint  _FrameSeed;
+float _ChunkRadius;
+float _AverageClumpRadius;
+float _SleepDelay;   // seconds a contacting fragment must stay slow before it sleeps (0 = sleep disabled). The
+                     // sleep timer lives in _ClumpVel.w, accumulated by the Voronoi collide pass.
+float _ClumpLifetime;
+float _Shrink;
+float _Dissolve;
+uint _ImpactFluidActive;                    // uniform fast gate: zero avoids the per-fragment state read entirely
+
+uint _ReleaseMode;                          // 0 = hit flags, 1 = all, 2 = sphere
+float4 _ReleaseCenterRadius;                // xyz center, w sphere radius
+float _ChunkedReleaseProgress;
+uint _ChunkedReleaseSeed;
+float3 _BodyVel;
+float _ReleaseImpulseMin;
+float _ReleaseImpulse;
+float _ReleaseSpinMin;
+float _ReleaseSpin;
+float _InheritBodyVelocity;
+uint _CopyHitMode;                          // 0 = _ClumpHitBackup <- _ClumpHit, 1 = _ClumpHit <- _ClumpHitBackup
+float4x4 _L2W;
+float4x4 _N2W;
+
+struct GpuFractureImpact
+{
+    float3 position; float radius;
+    float3 direction; float impulse;
+    float3 sourceVelocity; float spin;
+    float radialBlend; float upwardBias; float penetrationDepth; float velocityInheritance;
+    float falloff; int seed; int flags; float padding;
+    float3 fluidChannels; float fluidDuration;
+    float fluidBuoyancy; float fluidVelocityInherit; float fluidCellFraction; float fluidBlastDirection;
+    float fluidBurstSpeed; float fluidRadialSpread; float fluidTurbulence; float fluidSurfaceBias;
+};
+
+StructuredBuffer<GpuFractureImpact> _FractureImpacts;
+StructuredBuffer<float4> _ImpactClumpCentroid;
+uint _FractureImpactCount;
+float _FractureImpactMaxSpeed;
+float _FractureReleaseImpulseMin;
+float _FractureReleaseImpulseMax;
+float _FractureReleaseSpinMin;
+float _FractureReleaseSpinMax;
+uint _FractureReleaseSeed;
+
+float3 qrot(float4 q, float3 v) { return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
+float4 qmul(float4 a, float4 b)
+{
+    return float4(
+        a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz),
+        a.w * b.w - dot(a.xyz, b.xyz));
+}
+float3 safe_norm(float3 v, float3 fb) { float l = length(v); return l > 1e-5 ? v / l : fb; }
+
+// PCG RXS-M-XS GPU hash: O'Neill PCG family; GPU evaluation by Jarzynski & Olano, JCGT 9(3), 2020.
+float pcg(inout uint state)
+{
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    word = (word >> 22u) ^ word;
+    return float(word) / 4294967296.0;
+}
+float rand_range(inout uint s, float lo, float hi) { return lo + (hi - lo) * pcg(s); }
+
+uint hash_u32(uint x)
+{
+    x ^= x >> 16u; x *= 0x7feb352du;
+    x ^= x >> 15u; x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float hash01u(uint x)
+{
+    x = ((x >> 16u) ^ x) * 73244475u;
+    x = ((x >> 16u) ^ x) * 73244475u;
+    x = (x >> 16u) ^ x;
+    return float(x & 65535u) / 65535.0;
+}
+
+float3 rand_sphere(inout uint s)
+{
+    float u = pcg(s) * 2.0 - 1.0;
+    float theta = pcg(s) * 6.2831853;
+    float r = sqrt(max(0.0, 1.0 - u * u));
+    return float3(r * cos(theta), r * sin(theta), u);
+}
+
+float3 axis_planar_fallback(float3 axis, inout uint seed)
+{
+    float3 r = rand_sphere(seed);
+    r -= axis * dot(r, axis);
+    float3 basis = abs(axis.y) < 0.99
+        ? safe_norm(cross(axis, float3(0.0, 1.0, 0.0)), float3(1.0, 0.0, 0.0))
+        : safe_norm(cross(axis, float3(1.0, 0.0, 0.0)), float3(0.0, 0.0, 1.0));
+    return safe_norm(r, basis);
+}
+
+float force_falloff(float3 pos, float3 center, GpuForce f)
+{
+    float result = 1.0;
+    float shape = f.misc.x;
+    if (shape >= 0.5)
+    {
+        float3 d = pos - center;
+        float t;
+        if (shape < 1.5)
+        {
+            t = length(d) / max(f.boxHalf.w, 1e-4);
+        }
+        else
+        {
+            float3 ld = qrot(float4(-f.rot.xyz, f.rot.w), d);
+            float3 q = abs(ld) / max(f.boxHalf.xyz, 1e-4);
+            t = max(max(q.x, q.y), q.z);
+        }
+        if (t > 1.0)
+        {
+            result = 0.0;
+        }
+        else
+        {
+            float x = saturate(t) * 255.0;
+            uint i0 = (uint)floor(x);
+            uint i1 = min(i0 + 1u, 255u);
+            uint row = (uint)f.misc.y * 256u;
+            result = lerp(_ForceFalloff[row + i0], _ForceFalloff[row + i1], frac(x));
+        }
+    }
+    return result;
+}
+
+float3 turbulenceField(float3 pos, float t, float scale)
+{
+    float3 p = pos * scale;
+    float3 s1 = float3(
+        sin(p.y * 2.1 + t * 1.3) + cos(p.z * 1.7 - t * 0.8),
+        sin(p.z * 2.3 + t * 1.1) + cos(p.x * 1.9 - t * 1.0),
+        sin(p.x * 2.7 + t * 0.9) + cos(p.y * 1.3 - t * 1.2));
+    float3 s2 = float3(
+        sin(p.z * 5.3 - t * 2.1) * 0.5,
+        sin(p.x * 4.9 - t * 1.7) * 0.5,
+        sin(p.y * 5.7 - t * 2.3) * 0.5);
+    return s1 + s2;
+}
+
+float3 curl_turbulence(float3 pos, float t, float freq)
+{
+    const float e = 0.05;
+    float3 dx = turbulenceField(pos + float3(e, 0, 0), t, freq) - turbulenceField(pos - float3(e, 0, 0), t, freq);
+    float3 dy = turbulenceField(pos + float3(0, e, 0), t, freq) - turbulenceField(pos - float3(0, e, 0), t, freq);
+    float3 dz = turbulenceField(pos + float3(0, 0, e), t, freq) - turbulenceField(pos - float3(0, 0, e), t, freq);
+    float inv = 1.0 / (2.0 * e);
+    float3 c = float3(dy.z - dz.y, dz.x - dx.z, dx.y - dy.x) * inv;
+    return c / max(freq, 0.05);
+}
+
+void apply_turbulence_force(inout float3 vel, float3 pos, uint clumpSeed, uint forceIndex, GpuForce f,
+                            float massResponse)
+{
+    uint fseed = hash_u32(clumpSeed ^ hash_u32(forceIndex + 0x9e3779b9u));
+    float3 center = f.position.xyz + rand_sphere(fseed) * max(f.jitter.x, 0.0);
+    float fo = force_falloff(pos, center, f);
+    if (fo <= 0.0) return;
+    float strength = f.direction.w * (1.0 + rand_range(fseed, -saturate(f.jitter.z), saturate(f.jitter.z))) * fo;
+
+    float tDetail = saturate(f.extra.x);
+    float freq = (2.0 / max(f.extra.y, 0.05)) * exp2((hash01u(clumpSeed * 374761393u + 13u) * 2.0 - 1.0) * saturate(f.extra.z));
+    // Time-driven field so it keeps evolving (a static t=0 curl field has fixed sinks that pool bodies — see
+    // the matching note in BrazeParticles.compute). Pure conformance: bends motion toward flow, adds no pull.
+    float3 nn = curl_turbulence(pos, _TurbTime, freq);
+    nn += curl_turbulence(pos, _TurbTime, freq * 3.5) * tDetail;
+    nn = nn / (1.0 + tDetail);
+
+    float3 flow = safe_norm(nn, float3(0, 1, 0));
+    if (strength < 0.0) flow = -flow;
+    float spd = length(vel);
+    if (spd > 1e-5)
+    {
+        float3 cur = vel / spd;
+        float response = min(1.0 - exp(-abs(strength) * massResponse * _Dt), 0.35);
+        vel = safe_norm(lerp(cur, flow, response), cur) * spd;
+    }
+}
+
+void apply_forces(inout float3 vel, float3 pos, uint clumpSeed, float massResponse)
+{
+    uint n = min(_ForceCount, 32u);
+    for (uint i = 0u; i < n; i++)
+    {
+        GpuForce f = _Forces[i];
+        uint type = (uint)f.position.w;
+        if (type == 4u) continue;
+
+        uint fseed = hash_u32(clumpSeed ^ hash_u32(i + 0x9e3779b9u));
+        float3 center = f.position.xyz + rand_sphere(fseed) * max(f.jitter.x, 0.0);
+        float dirJit = saturate(f.jitter.y);
+        float strJit = saturate(f.jitter.z);
+        float varied = f.direction.w * (1.0 + rand_range(fseed, -strJit, strJit));
+        float fo = force_falloff(pos, center, f);
+        if (fo <= 0.0) continue;
+        float strength = varied * fo;
+
+        if (type == 0u)
+        {
+            float3 dir = safe_norm(f.direction.xyz + rand_sphere(fseed) * dirJit, float3(1, 0, 0));
+            // misc.z distinguishes real gravity from directional wind. Gravity acceleration is independent of
+            // mass; wind is an aerodynamic force and moves a solid block less than a thin/light fragment.
+            float directionalResponse = f.misc.z > 0.5 ? 1.0 : massResponse;
+            vel += dir * strength * directionalResponse * _Dt;
+        }
+        else if (type == 1u)
+        {
+            float3 outward = safe_norm(pos - center, rand_sphere(fseed));
+            float radialVel = dot(vel, outward);
+            float maxStep = abs(strength) * 4.0 * massResponse * _Dt;
+            float delta = strength - radialVel;
+            vel += outward * ((strength >= 0.0) ? clamp(delta, 0.0, maxStep) : clamp(delta, -maxStep, 0.0));
+        }
+        else if (type == 2u)
+        {
+            float3 axis = safe_norm(f.direction.xyz + rand_sphere(fseed) * dirJit, float3(0, 1, 0));
+            float3 radial = pos - center;
+            float3 planar = radial - axis * dot(radial, axis);
+            float planarLen = length(planar);
+            float3 fallbackOutward = axis_planar_fallback(axis, fseed);
+            float3 outward = safe_norm(planar, fallbackOutward);
+            float3 tangent = safe_norm(cross(axis, outward), safe_norm(cross(axis, fallbackOutward), float3(1, 0, 0)));
+            float mode = f.misc.w;
+            if (mode < 0.5)                          // Swirl — speed-preserving rotation about the axis (stable orbit)
+            {
+                float phi = strength * massResponse * _Dt; // a massive fragment turns into the field more slowly
+                float si, co; sincos(phi, si, co);
+                vel = vel * co + cross(axis, vel) * si + axis * dot(axis, vel) * (1.0 - co);
+            }
+            else                                     // Inward / Orbit — spin up tangentially, then pull to a radius
+            {
+                float fieldRadius = (f.misc.x > 1.5) ? min(min(f.boxHalf.x, f.boxHalf.y), f.boxHalf.z) : max(f.boxHalf.w, 0.0);
+                float spin = saturate(abs(strength) * massResponse * _Dt);
+                float radialVel = dot(vel, outward);
+                float tangVel = dot(vel, tangent);
+                float3 nextVel = vel + tangent * ((strength - tangVel) * spin);
+                float hold = saturate(max(f.misc.z, 0.0) * massResponse * _Dt);
+                if (mode < 1.5)
+                    nextVel += outward * ((-planarLen * max(abs(strength), 1.0) - radialVel) * hold);
+                else
+                {
+                    // Orbit Radius as set; only clamp inside a bounded region (Infinite has no edge to clamp to).
+                    float targetRadius = max(f.jitter.w, 0.0);
+                    if (f.misc.x > 0.5)
+                        targetRadius = min(targetRadius, max(fieldRadius * 0.95, 0.0001));
+                    nextVel += outward * ((-(planarLen - targetRadius) * max(abs(strength), 1.0) - radialVel) * hold);
+                    float axialDamp = saturate(max(f.misc.z, 0.0) * max(abs(strength), 1.0) * 2.0 * _Dt);
+                    nextVel -= axis * (dot(nextVel, axis) * axialDamp);
+                }
+                vel = nextVel;
+            }
+
+            // Axial control (all modes): ease the along-axis velocity toward Lift (extra.x); Axial Damp (extra.y)
+            // sets how firmly — the column-height knob. Damp 0 = free drift, Lift 0 = flatten, Lift > 0 = updraft.
+            float vAxDamp = saturate(f.extra.y);
+            if (vAxDamp > 0.0 || abs(f.extra.x) > 1e-6)   // Lift OR Axial Damp active (else free column)
+            {
+                // Lift drives the along-axis speed on its own (base rate); Axial Damp firms it / settles a free column.
+                float liftVar = saturate(f.extra.z);
+                float lift = f.extra.x * (1.0 + rand_range(fseed, -liftVar, liftVar));   // per-particle ± (stable)
+                float axialVel = dot(vel, axis);
+                float k = 1.0 - exp(-(2.0 + vAxDamp * 10.0) * massResponse * _Dt);
+                vel += axis * ((lift - axialVel) * k);
+            }
+        }
+        else if (type == 3u)
+        {
+            // Drag used to be applied twice and ignored body size. One area/mass-scaled decay is the intended law.
+            vel *= saturate(1.0 - strength * massResponse * _Dt);
+        }
+    }
+
+    for (uint ti = 0u; ti < n; ti++)
+    {
+        GpuForce f = _Forces[ti];
+        if ((uint)f.position.w == 4u) apply_turbulence_force(vel, pos, clumpSeed, ti, f, massResponse);
+    }
+}
+
+float4 collide_plane(float3 pos, float3 vel, GpuCollider c, float radius)
+{
+    float4 q = c.rot;
+    float3 d = pos - c.center.xyz;
+    float3 n = safe_norm(c.normal.xyz, float3(0, 1, 0));
+    float sd = dot(d, n);
+    float lx = dot(d, qrot(q, float3(1, 0, 0)));
+    float lz = dot(d, qrot(q, float3(0, 0, 1)));
+    float4 result = float4(n, -1.0);
+    if (!(abs(lx) > c.extent.x + radius || abs(lz) > c.extent.z + radius) && !(sd < -radius || sd > radius))
+        result = float4(n, radius - sd);
+    return result;
+}
+
+float4 collide_sphere(float3 pos, GpuCollider c, float radius)
+{
+    float3 d = pos - c.center.xyz;
+    float dist = length(d);
+    float3 n = safe_norm(d, float3(0, 1, 0));
+    return float4(n, (c.normal.w + radius) - dist);
+}
+
+float4 collide_box(float3 pos, GpuCollider c, float radius)
+{
+    float4 q = c.rot;
+    float3 ld = qrot(float4(-q.xyz, q.w), pos - c.center.xyz);
+    float3 hs = max(c.extent.xyz, 1e-4) + radius;
+    float3 qd = abs(ld) - hs;
+    float4 result = float4(0, 1, 0, -1.0);
+    if (max(max(qd.x, qd.y), qd.z) > 0.0)
+    {
+        float3 outside = max(qd, 0.0);
+        float od = length(outside);
+        if (od <= radius)
+        {
+            float3 worldOut = qrot(q, outside * sign(ld));
+            result = float4(safe_norm(worldOut, float3(0, 1, 0)), radius - od);
+        }
+    }
+    else
+    {
+        float px = hs.x - abs(ld.x), py = hs.y - abs(ld.y), pz = hs.z - abs(ld.z);
+        if (px <= py && px <= pz)      result = float4(qrot(q, float3(sign(ld.x), 0, 0)), px);
+        else if (py <= pz)             result = float4(qrot(q, float3(0, sign(ld.y), 0)), py);
+        else                           result = float4(qrot(q, float3(0, 0, sign(ld.z))), pz);
+    }
+    return result;
+}
+
+void apply_colliders(inout float3 pos, inout float3 vel, uint clumpSeed, float massResponse)
+{
+    uint n = min(_ColliderCount, 16u);
+    for (uint i = 0u; i < n; i++)
+    {
+        GpuCollider c = _Colliders[i];
+        uint cseed = hash_u32(clumpSeed ^ hash_u32(i + 0x9e3779b9u));
+        uint shape = (uint)c.center.w;
+        float4 hit = (shape == 0u) ? collide_plane(pos, vel, c, _ChunkRadius)
+                   : (shape == 1u) ? collide_sphere(pos, c, _ChunkRadius)
+                                   : collide_box(pos, c, _ChunkRadius);
+        if (hit.w <= 0.0) continue;
+
+        float jb = c.jitter.x, jf = c.jitter.y, js = c.jitter.z;
+        float bounce = saturate(c.response.x * (1.0 + rand_range(cseed, -jb, jb)));
+        bounce *= sqrt(saturate(massResponse));   // large/solid bodies retain far less toy-like restitution
+        float friction = saturate(c.response.y * (1.0 + rand_range(cseed, -jf, jf)));
+        float strength = saturate(c.response.z * (1.0 + rand_range(cseed, -js, js)));
+        float3 nrm = hit.xyz;
+        pos += nrm * hit.w * strength;
+        float vn = dot(vel, nrm);
+        if (vn < 0.0) vel -= nrm * vn * (1.0 + bounce);
+        float3 normalV = nrm * max(dot(vel, nrm), 0.0);
+        float3 tangentV = (vel - normalV) * saturate(1.0 - friction);
+        vel = normalV + tangentV;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void MarkChunkedHits(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _ClumpCount) return;
+
+    float4 ps = _ClumpPosState[c];
+    if (ps.w >= 0.5)
+    {
+        _ClumpHit[c] = 0u;
+        return;
+    }
+
+    float key = hash01u(hash_u32(c ^ _ChunkedReleaseSeed));
+    _ClumpHit[c] = key <= saturate(_ChunkedReleaseProgress) ? 1u : 0u;
+}
+
+[numthreads(64, 1, 1)]
+void ReleaseClumps(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _ClumpCount) return;
+
+    float4 ps = _ClumpPosState[c];
+    if (ps.w >= 0.5)
+    {
+        if (_ReleaseMode == 0u) _ClumpHit[c] = 0u;
+        return;
+    }
+
+    bool release = _ReleaseMode == 1u || (_ReleaseMode == 0u && _ClumpHit[c] != 0u);
+    if (!release && _ReleaseMode != 2u)
+    {
+        if (_ReleaseMode == 0u) _ClumpHit[c] = 0u;
+        return;
+    }
+
+    uint2 range = _ClumpRange[c];
+    if (range.y == 0u)
+    {
+        if (_ReleaseMode == 0u) _ClumpHit[c] = 0u;
+        return;
+    }
+
+    float3 cen = float3(0.0, 0.0, 0.0);
+    for (uint k = 0u; k < range.y; k++)
+    {
+        uint si = range.x + k;
+        uint oi = _ShatteredIds[si].y;
+        cen += mul(_L2W, float4(_DeformedPos[oi], 1.0)).xyz;
+    }
+    cen /= max((float)range.y, 1.0);
+
+    if (_ReleaseMode == 2u)
+    {
+        float3 d = cen - _ReleaseCenterRadius.xyz;
+        release = dot(d, d) <= _ReleaseCenterRadius.w * _ReleaseCenterRadius.w;
+    }
+    if (!release)
+    {
+        if (_ReleaseMode == 0u) _ClumpHit[c] = 0u;
+        return;
+    }
+
+    uint seed = hash_u32(c + 0x51f15eedu);
+    float3 fromCenter = cen - _ReleaseCenterRadius.xyz;
+    float3 outDir = safe_norm(fromCenter, rand_sphere(seed));
+    float sampledImpulse = rand_range(seed,
+        min(_ReleaseImpulseMin, _ReleaseImpulse), max(_ReleaseImpulseMin, _ReleaseImpulse));
+    float impulseMagnitude = abs(sampledImpulse);
+    float3 vel = outDir * sampledImpulse
+               + float3(0.0, 1.0, 0.0) * (impulseMagnitude * 0.3)
+               + rand_sphere(seed) * (pcg(seed) * impulseMagnitude * 0.4)
+               + _BodyVel * _InheritBodyVelocity;
+    float spinSpeed = rand_range(seed, min(_ReleaseSpinMin, _ReleaseSpin), max(_ReleaseSpinMin, _ReleaseSpin));
+    float3 angVel = rand_sphere(seed) * spinSpeed;
+
+    for (uint ck = 0u; ck < range.y; ck++)
+    {
+        uint si = range.x + ck;
+        uint oi = _ShatteredIds[si].y;
+        float3 wp = mul(_L2W, float4(_DeformedPos[oi], 1.0)).xyz;
+        float3 wn = mul((float3x3)_N2W, _DeformedNrm[oi]);
+        _FreeOffset[si] = wp - cen;
+        _FreeNrm[si] = safe_norm(wn, float3(0.0, 1.0, 0.0));
+    }
+
+    _ClumpPosState[c] = float4(cen, 1.0);
+    _ClumpRot[c] = float4(0.0, 0.0, 0.0, 1.0);
+    _ClumpLife[c] = float4(1.0, 0.0, length(vel), 0.0);
+    _ClumpVel[c] = float4(vel, 0.0);
+    _ClumpAngVel[c] = float4(angVel, 0.0);
+
+    _ClumpHit[c] = 2u;
+}
+
+float3 fracture_impact_nearest(GpuFractureImpact impact, float3 samplePosition)
+{
+    float3 direction = safe_norm(impact.direction, float3(0.0, 0.0, 1.0));
+    float3 segment = direction * max(0.0, impact.penetrationDepth);
+    float segmentLengthSq = dot(segment, segment);
+    float segmentT = segmentLengthSq > 1e-8
+        ? saturate(dot(samplePosition - impact.position, segment) / segmentLengthSq)
+        : 0.0;
+    return impact.position + segment * segmentT;
+}
+
+float fracture_impact_weight(GpuFractureImpact impact, float3 samplePosition, float fragmentRadius)
+{
+    float3 nearest = fracture_impact_nearest(impact, samplePosition);
+    // Centroid distance alone misses large surface fragments. Treat each fragment as its authored bounding sphere,
+    // so a projectile volume touching the visible wall reliably selects that cell without a CPU/GPU readback.
+    float reach = max(0.001, impact.radius + fragmentRadius);
+    float normalizedDistance = saturate(1.0 - distance(samplePosition, nearest) / reach);
+    return pow(normalizedDistance, max(0.01, impact.falloff));
+}
+
+float3 clamp_impact_speed(float3 velocity)
+{
+    float speed = length(velocity);
+    if (_FractureImpactMaxSpeed > 0.0 && speed > _FractureImpactMaxSpeed)
+        velocity *= _FractureImpactMaxSpeed / speed;
+    return velocity;
+}
+
+// Rigid-cluster mirror buffers (aliases of the BrazeVoronoi.compute island buffers). A free cell that belongs to
+// an active island is kinematic — writing its velocity would be overwritten by the next IslandProject — so impact
+// commands aggregate into the island's fixed-point accumulators instead (same layout as the contact stage) and
+// can break the island exactly like a hard landing.
+StructuredBuffer<uint>   _IslandOfSim;
+StructuredBuffer<float4> _IslandPosStateSim;
+RWStructuredBuffer<int>  _IslandAccumSim;
+uint _IslandRoutingOn;
+#define SIM_ISLAND_NONE 0xffffffffu
+#define SIM_ISLAND_FP 1024.0
+#define SIM_ISLAND_ACC 24   // must match ISLAND_ACC in BrazeVoronoi.compute and IslandAccumInts in C#
+
+// Fluid tagging is deliberately separate from ApplyFractureImpacts. The fracture pass already writes eight UAVs,
+// which is the limit on several supported graphics APIs; keeping this pass to four compact fluid UAVs avoids exceeding
+// that limit while retaining one thread per fragment and one batched dispatch for all impacts queued this frame.
+[numthreads(64, 1, 1)]
+void TagImpactFluid(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _ClumpCount || _FractureImpactCount == 0u) return;
+
+    float4 ps = _ClumpPosStateRead[c];
+    bool alreadyFree = ps.w >= 0.5;
+    float4 centroidRadius = _ImpactClumpCentroid[c];
+    float3 samplePoint = alreadyFree ? ps.xyz : centroidRadius.xyz;
+    float3 channelRates = float3(0.0, 0.0, 0.0);
+    float duration = 0.0;
+    float buoyancySum = 0.0;
+    float buoyancyWeight = 0.0;
+    float velocityInheritSum = 0.0;
+    float velocityInheritWeight = 0.0;
+    float3 surfaceDirectionSum = float3(0.0, 0.0, 0.0);
+    float surfaceBiasSum = 0.0;
+    float3 ejectaVelocitySum = float3(0.0, 0.0, 0.0);
+    float turbulenceSum = 0.0;
+    float plumeWeight = 0.0;
+    // A stable fragment-id threshold makes percentages nested: repeated or overlapping impacts reuse the same
+    // eligible cells instead of gradually expanding toward 100% and defeating the authored performance cap.
+    float cellSelection = hash01u(hash_u32(c ^ 0x6d2b79f5u));
+
+    for (uint impactIndex = 0u; impactIndex < _FractureImpactCount; impactIndex++)
+    {
+        GpuFractureImpact impact = _FractureImpacts[impactIndex];
+        if ((impact.flags & 2) == 0 || impact.fluidDuration <= 0.0) continue;
+        if (alreadyFree && (impact.flags & 1) == 0) continue;
+        if (cellSelection >= saturate(impact.fluidCellFraction)) continue;
+
+        float weight = fracture_impact_weight(impact, samplePoint, centroidRadius.w);
+        if (weight <= 1e-6) continue;
+
+        float3 rates = max(impact.fluidChannels, 0.0);
+        if (all(rates <= 1e-6)) continue;
+        channelRates += rates * weight;
+        duration = max(duration, impact.fluidDuration);
+
+        float liftWeight = max(rates.x + rates.y, 1e-6) * weight;
+        buoyancySum += impact.fluidBuoyancy * liftWeight;
+        buoyancyWeight += liftWeight;
+        velocityInheritSum += saturate(impact.fluidVelocityInherit) * weight;
+        velocityInheritWeight += weight;
+
+        float3 travelDirection = safe_norm(impact.direction, float3(0.0, 0.0, 1.0));
+        float3 nearest = fracture_impact_nearest(impact, samplePoint);
+        float3 fragmentInward = safe_norm(samplePoint - nearest, travelDirection);
+        float3 surfaceOutward = -fragmentInward;
+        // Blast Direction signs the AXIAL half of the plume: -1 spits back along the incoming trajectory (a
+        // muzzle-facing back-blast, the historical hard-coded behaviour), +1 drives it onward through the wall,
+        // and 0 removes the axial term entirely so only the surface-outward spread and the slight lift remain.
+        // Radial Spread still dials how much of the plume follows the struck surface instead of this axis.
+        float3 axialDirection = travelDirection * clamp(impact.fluidBlastDirection, -1.0, 1.0);
+        float3 ejectaDirection = safe_norm(
+            lerp(axialDirection, surfaceOutward, saturate(impact.fluidRadialSpread))
+            + float3(0.0, 0.12, 0.0),
+            surfaceOutward);
+        float contribution = max(rates.x + rates.y + rates.z, 1e-6) * weight;
+        surfaceDirectionSum += surfaceOutward * contribution;
+        surfaceBiasSum += saturate(impact.fluidSurfaceBias) * contribution;
+        ejectaVelocitySum += ejectaDirection * max(0.0, impact.fluidBurstSpeed) * contribution;
+        turbulenceSum += max(0.0, impact.fluidTurbulence) * contribution;
+        plumeWeight += contribution;
+    }
+
+    if (duration <= 0.0 || all(channelRates <= 1e-6)) return;
+
+    float4 previous = _ImpactFluidState[c];
+    _ImpactFluidState[c] = float4(max(previous.xyz, channelRates), max(previous.w, duration));
+    float buoyancy = buoyancyWeight > 1e-6 ? buoyancySum / buoyancyWeight : 0.0;
+    float velocityInherit = velocityInheritWeight > 1e-6
+        ? velocityInheritSum / velocityInheritWeight
+        : 0.0;
+    _ImpactFluidMotion[c] = (f32tof16(velocityInherit) << 16) | (f32tof16(buoyancy) & 0xffffu);
+    if (plumeWeight > 1e-6)
+    {
+        float4 rotation = _ClumpRotRead[c];
+        float4 inverseRotation = float4(-rotation.xyz, rotation.w);
+        float surfaceBias = surfaceBiasSum / plumeWeight;
+        float3 surfaceWorld = safe_norm(surfaceDirectionSum, float3(0.0, 1.0, 0.0));
+        float3 ejectaWorld = ejectaVelocitySum / plumeWeight;
+        _ImpactFluidGeometry[c] = float4(qrot(inverseRotation, surfaceWorld) * surfaceBias, duration);
+        _ImpactFluidVelocity[c] = float4(qrot(inverseRotation, ejectaWorld), turbulenceSum / plumeWeight);
+    }
+}
+
+// One thread owns one fragment, so overlapping bullet/shell commands accumulate without atomics. The CPU uploads
+// all commands once per frame and this pass performs one dispatch regardless of the number of impacts.
+[numthreads(64, 1, 1)]
+void ApplyFractureImpacts(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _ClumpCount || _FractureImpactCount == 0u) return;
+
+    float4 ps = _ClumpPosState[c];
+    bool alreadyFree = ps.w >= 0.5;
+
+    // Rigid-cluster members are kinematic (re-posed from the island transform every frame): their impact response
+    // is aggregated into the island by the single-UAV RouteImpactsToIslands pass instead — this kernel already sits
+    // at the 8-UAV limit and must not touch them.
+    if (alreadyFree && _IslandRoutingOn != 0u)
+    {
+        uint islandRoot = _IslandOfSim[c];
+        if (islandRoot != SIM_ISLAND_NONE && islandRoot < _ClumpCount
+            && _IslandPosStateSim[islandRoot].w >= 0.5)
+            return;
+    }
+
+    float4 centroidRadius = _ImpactClumpCentroid[c];
+    float3 samplePoint = alreadyFree ? ps.xyz : centroidRadius.xyz;
+    float3 velocityDelta = float3(0.0, 0.0, 0.0);
+    float3 angularDelta = float3(0.0, 0.0, 0.0);
+    float3 releaseDirectionSum = float3(0.0, 0.0, 0.0);
+    bool impacted = false;
+
+    for (uint impactIndex = 0u; impactIndex < _FractureImpactCount; impactIndex++)
+    {
+        GpuFractureImpact impact = _FractureImpacts[impactIndex];
+        if (alreadyFree && (impact.flags & 1) == 0) continue;
+
+        float weight = fracture_impact_weight(impact, samplePoint, centroidRadius.w);
+        if (weight <= 1e-6) continue;
+
+        float3 travelDirection = safe_norm(impact.direction, float3(0.0, 0.0, 1.0));
+        float3 radialDirection = safe_norm(samplePoint - impact.position, -travelDirection);
+        float3 pushDirection = safe_norm(
+            lerp(travelDirection, radialDirection, saturate(impact.radialBlend))
+            + float3(0.0, max(0.0, impact.upwardBias), 0.0),
+            travelDirection);
+        velocityDelta += pushDirection * max(0.0, impact.impulse) * weight;
+        velocityDelta += impact.sourceVelocity * max(0.0, impact.velocityInheritance) * weight;
+        releaseDirectionSum += pushDirection * weight;
+
+        uint randomState = hash_u32(c * 0x9e3779b9u ^ impactIndex * 0x85ebca6bu ^ (uint)impact.seed);
+        angularDelta += rand_sphere(randomState) * max(0.0, impact.spin) * weight;
+        impacted = true;
+    }
+
+    if (!impacted) return;
+
+    if (alreadyFree)
+    {
+        float3 velocity = clamp_impact_speed(_ClumpVel[c].xyz + velocityDelta);
+        _ClumpVel[c] = float4(velocity, 0.0); // reset the contact sleep timer and wake the fragment
+        _ClumpAngVel[c] = float4(_ClumpAngVel[c].xyz + angularDelta, 0.0);
+        float4 life = _ClumpLife[c];
+        life.z = length(velocity);
+        _ClumpLife[c] = life;
+        return;
+    }
+
+    uint2 range = _ClumpRange[c];
+    if (range.y == 0u) return;
+
+    float3 center = float3(0.0, 0.0, 0.0);
+    for (uint centroidVertex = 0u; centroidVertex < range.y; centroidVertex++)
+    {
+        uint shatteredIndex = range.x + centroidVertex;
+        uint originalIndex = _ShatteredIds[shatteredIndex].y;
+        center += mul(_L2W, float4(_DeformedPos[originalIndex], 1.0)).xyz;
+    }
+    center /= max((float)range.y, 1.0);
+
+    for (uint captureVertex = 0u; captureVertex < range.y; captureVertex++)
+    {
+        uint shatteredIndex = range.x + captureVertex;
+        uint originalIndex = _ShatteredIds[shatteredIndex].y;
+        float3 worldPosition = mul(_L2W, float4(_DeformedPos[originalIndex], 1.0)).xyz;
+        float3 worldNormal = mul((float3x3)_N2W, _DeformedNrm[originalIndex]);
+        _FreeOffset[shatteredIndex] = worldPosition - center;
+        _FreeNrm[shatteredIndex] = safe_norm(worldNormal, float3(0.0, 1.0, 0.0));
+    }
+
+    uint releaseRandomState = hash_u32(c * 0x9e3779b9u ^ _FractureReleaseSeed);
+    float releaseImpulse = rand_range(releaseRandomState,
+        min(_FractureReleaseImpulseMin, _FractureReleaseImpulseMax),
+        max(_FractureReleaseImpulseMin, _FractureReleaseImpulseMax));
+    float releaseImpulseMagnitude = abs(releaseImpulse);
+    float3 releaseDirection = safe_norm(releaseDirectionSum, float3(0.0, 0.0, 1.0));
+    velocityDelta += releaseDirection * releaseImpulse
+                   + float3(0.0, 1.0, 0.0) * (releaseImpulseMagnitude * 0.3)
+                   + rand_sphere(releaseRandomState) * (pcg(releaseRandomState) * releaseImpulseMagnitude * 0.4);
+    float3 velocity = clamp_impact_speed(velocityDelta);
+    float releaseSpinSpeed = rand_range(releaseRandomState,
+        min(_FractureReleaseSpinMin, _FractureReleaseSpinMax),
+        max(_FractureReleaseSpinMin, _FractureReleaseSpinMax));
+    angularDelta += rand_sphere(releaseRandomState) * releaseSpinSpeed;
+    _ClumpPosState[c] = float4(center, 1.0);
+    _ClumpRot[c] = float4(0.0, 0.0, 0.0, 1.0);
+    _ClumpLife[c] = float4(1.0, 0.0, length(velocity), 0.0);
+    _ClumpVel[c] = float4(velocity, 0.0);
+    _ClumpAngVel[c] = float4(angularDelta, 0.0);
+    _ClumpHit[c] = 2u;
+}
+
+// Impact commands aimed at rigid-cluster members, aggregated into the island body. Split from
+// ApplyFractureImpacts because that kernel already writes the 8-UAV maximum — this pass writes exactly ONE UAV
+// (the island accumulators) and reads everything else. Same weight/push math as the free-cell branch there.
+[numthreads(64, 1, 1)]
+void RouteImpactsToIslands(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _ClumpCount || _FractureImpactCount == 0u || _IslandRoutingOn == 0u) return;
+
+    float4 ps = _ClumpPosStateRead[c];
+    if (ps.w < 0.5) return;
+    uint islandRoot = _IslandOfSim[c];
+    if (islandRoot == SIM_ISLAND_NONE || islandRoot >= _ClumpCount
+        || _IslandPosStateSim[islandRoot].w < 0.5) return;
+
+    float4 centroidRadius = _ImpactClumpCentroid[c];
+    float3 samplePoint = ps.xyz;
+    float3 velocityDelta = float3(0.0, 0.0, 0.0);
+    bool impacted = false;
+
+    for (uint impactIndex = 0u; impactIndex < _FractureImpactCount; impactIndex++)
+    {
+        GpuFractureImpact impact = _FractureImpacts[impactIndex];
+        if ((impact.flags & 1) == 0) continue;   // members are free bodies — honour Affect Released
+
+        float weight = fracture_impact_weight(impact, samplePoint, centroidRadius.w);
+        if (weight <= 1e-6) continue;
+
+        float3 travelDirection = safe_norm(impact.direction, float3(0.0, 0.0, 1.0));
+        float3 radialDirection = safe_norm(samplePoint - impact.position, -travelDirection);
+        float3 pushDirection = safe_norm(
+            lerp(travelDirection, radialDirection, saturate(impact.radialBlend))
+            + float3(0.0, max(0.0, impact.upwardBias), 0.0),
+            travelDirection);
+        velocityDelta += pushDirection * max(0.0, impact.impulse) * weight;
+        velocityDelta += impact.sourceVelocity * max(0.0, impact.velocityInheritance) * weight;
+        impacted = true;
+    }
+
+    if (!impacted) return;
+    float3 impulse = clamp_impact_speed(velocityDelta);
+    float3 torque = cross(ps.xyz - _IslandPosStateSim[islandRoot].xyz, impulse);
+    // Impact slots (16..22): applied ÷ island mass by IslandApplyContacts — momentum, not the contact mean.
+    int base = (int)(islandRoot * (uint)SIM_ISLAND_ACC);
+    InterlockedAdd(_IslandAccumSim[base + 16], (int)round(impulse.x * SIM_ISLAND_FP));
+    InterlockedAdd(_IslandAccumSim[base + 17], (int)round(impulse.y * SIM_ISLAND_FP));
+    InterlockedAdd(_IslandAccumSim[base + 18], (int)round(impulse.z * SIM_ISLAND_FP));
+    InterlockedAdd(_IslandAccumSim[base + 19], (int)round(torque.x * SIM_ISLAND_FP));
+    InterlockedAdd(_IslandAccumSim[base + 20], (int)round(torque.y * SIM_ISLAND_FP));
+    InterlockedAdd(_IslandAccumSim[base + 21], (int)round(torque.z * SIM_ISLAND_FP));
+    InterlockedAdd(_IslandAccumSim[base + 22], 1);
+    InterlockedMax(_IslandAccumSim[base + 11], (int)round(length(impulse) * SIM_ISLAND_FP));
+}
+
+[numthreads(64, 1, 1)]
+void DebrisFromReleased(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _ClumpCount) return;
+    if (_ClumpHit[c] != 2u) return;
+
+    uint debrisCap = min(_DebrisReqCapacity, _DebrisMaxRequests);
+    if (_DebrisCount > 0u && debrisCap > 0u)
+    {
+        uint2 range = _ClumpRange[c];
+        if (range.y == 0u)
+        {
+            _ClumpHit[c] = 0u;
+            return;
+        }
+
+        uint seed = hash_u32((c + 0x51f15eedu) ^ _DebrisSpawnSalt);
+        float3 cen = _ClumpPosStateRead[c].xyz;
+        float3 vel = _ClumpVelRead[c].xyz;
+        float3 ang = _ClumpAngVelRead[c].xyz;
+        // attach: bit2 + clump index packed in the high bits; rq.velocity carries the BODY-LOCAL offset instead.
+        uint flags = (_DebrisAttach != 0u) ? (4u | (c << 3)) : 1u;
+        for (uint dk = 0u; dk < _DebrisCount; dk++)
+        {
+            uint dseed = hash_u32(seed ^ hash_u32(dk * 0x9e3779b9u + 0x27d4eb2du));
+            // Thin individual burst requests instead of rounding the CPU count. This preserves meaningful values for
+            // tiny bursts: at Burst / Fragment = 1 and 25%, approximately one in four fragments emits one particle.
+            // Use a separate state so changing only the percentage removes samples without moving the retained ones.
+            uint keepSeed = hash_u32(dseed ^ 0xb5297a4du);
+            if (_DebrisSpawnProbability < 1.0 && pcg(keepSeed) >= saturate(_DebrisSpawnProbability)) continue;
+
+            uint di; InterlockedAdd(_DebrisReqCount[0], 1u, di);
+            // Overflow: this slot is past the budget and is NEVER written, so undo the over-increment.
+            // Otherwise the published count outruns the written slots and the emitter's EmitRequests drains
+            // stale/garbage entries in [debrisCap, count) — spawning junk particles. Critical with multiple
+            // emitters, where the per-emitter budget (debrisCap) is small and the cap is hit every fragment.
+            if (di >= debrisCap) { InterlockedAdd(_DebrisReqCount[0], 0xFFFFFFFFu); break; }
+
+            uint si = range.x + min((uint)(pcg(dseed) * (float)range.y), range.y - 1u);
+            float3 offs = _FreeOffsetRead[si];   // body-local at release (clump rotation is identity here)
+            float3 nrm = _FreeNrmRead[si];
+            float3 surfaceVel = vel + cross(ang, offs);
+
+            SpawnRequest rq;
+            rq.position = float4(cen + offs, asfloat(flags));
+            rq.velocity = (_DebrisAttach != 0u) ? float4(offs, 0.0)
+                                                : float4(surfaceVel * _DebrisVelocityInherit + nrm * _DebrisScatter, 0.0);
+            rq.color = float4(1.0, 1.0, 1.0, 1.0);
+            _DebrisRequests[di] = rq;
+        }
+    }
+    _ClumpHit[c] = 0u;
+}
+
+[numthreads(64, 1, 1)]
+void DebrisFromFreeClumps(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _ClumpCount) return;
+
+    float4 ps = _ClumpPosStateRead[c];
+    if (ps.w < 0.5) return;
+
+    float4 life = _ClumpLifeRead[c];
+    float scale = max(life.x, 0.0);
+    if (scale <= 0.001) return;
+
+    // Settled debris stops shedding — otherwise resting fragments leak a thin stream of particles forever (they
+    // fall away from the chunk). Keyed on actual velocity, so it works whether the chunk rested via shape-aware
+    // sleep or the cheap collision. A chunk that is DISSOLVING (scale < ~1 → Lifetime active) keeps crumbling
+    // regardless, preserving the disintegrator's in-place crumble. Gate is off when _DebrisSettleSpeed == 0.
+    float4 velF = _ClumpVelRead[c];
+    if (_DebrisSettleSpeed > 0.0 && scale >= 0.999 && dot(velF.xyz, velF.xyz) < _DebrisSettleSpeed * _DebrisSettleSpeed)
+        return;
+
+    uint2 range = _ClumpRange[c];
+    if (range.y == 0u) return;
+
+    uint debrisCap = min(_DebrisReqCapacity, _DebrisMaxRequests);
+    if (_DebrisRate <= 0.0 || debrisCap == 0u) return;
+
+    uint seed = hash_u32(c ^ _FrameSeed ^ _DebrisSpawnSalt ^ hash_u32((uint)(life.w * 997.0 + 17.0)));
+    float crumble = (_ClumpLifetime > 0.0) ? saturate(max(1.0 - scale, life.y)) : 1.0;
+    float expected = _DebrisRate * _Dt * lerp(0.35, 1.5, crumble);
+    uint emitCount = (uint)floor(expected);
+    if (pcg(seed) < frac(expected)) emitCount++;
+    emitCount = min(emitCount, 64u);
+    if (emitCount == 0u) return;
+
+    float4 q = _ClumpRotRead[c];
+    float3 cen = ps.xyz;
+    float3 vel = _ClumpVelRead[c].xyz;
+    float3 ang = _ClumpAngVelRead[c].xyz;
+    // attach: bit2 + clump index packed in the high bits; rq.velocity carries the BODY-LOCAL offset instead.
+    uint flags = (_DebrisAttach != 0u) ? (4u | (c << 3)) : 1u;
+
+    for (uint dk = 0u; dk < emitCount; dk++)
+    {
+        uint di; InterlockedAdd(_DebrisReqCount[0], 1u, di);
+        // Overflow: undo the over-increment so the published count never outruns the written slots (see
+        // DebrisFromReleased). Without this the emitter drains stale slots past the budget as garbage particles.
+        if (di >= debrisCap) { InterlockedAdd(_DebrisReqCount[0], 0xFFFFFFFFu); break; }
+
+        uint si = range.x + min((uint)(pcg(seed) * (float)range.y), range.y - 1u);
+        float3 rawOffset = _FreeOffsetRead[si];
+        float3 localOffset = rawOffset * scale;          // body-local (pre-rotation) offset for attachment
+        float3 offs = qrot(q, localOffset);
+        float3 nrm = qrot(q, _FreeNrmRead[si]);
+        float dscale = (_ClumpLifetime > 0.0 && life.w < _ClumpLifetime) ? (-_Shrink / _ClumpLifetime) : 0.0;
+        float3 shrinkVel = qrot(q, rawOffset * dscale);
+        float3 surfaceVel = vel + cross(ang, offs) + shrinkVel;
+
+        SpawnRequest rq;
+        rq.position = float4(cen + offs, asfloat(flags));
+        rq.velocity = (_DebrisAttach != 0u) ? float4(localOffset, 0.0)
+                                            : float4(surfaceVel * _DebrisVelocityInherit + nrm * _DebrisScatter, 0.0);
+        rq.color = float4(1.0, 1.0, 1.0, 1.0);
+        _DebrisRequests[di] = rq;
+    }
+}
+
+[numthreads(64,1,1)]
+void CopyClumpHits(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _ClumpCount) return;
+    if (_CopyHitMode == 0u) _ClumpHitBackup[c] = _ClumpHit[c];
+    else _ClumpHit[c] = _ClumpHitBackup[c];
+}
+
+void SimClumpsCore(uint i)
+{
+    if (i >= _ClumpCount) return;
+
+#if defined(BRAZE_FRACTURE_CLUMP_DATA)
+    // Impact smoke/fire follows the fragment for its authored window. Age it inside the existing clump pass so
+    // the feature adds no timer dispatch and no CPU fragment tracking/readback.
+    if (_ImpactFluidActive != 0u)
+    {
+        float4 impactFluid = _ImpactFluidState[i];
+        if (impactFluid.w > 0.0)
+        {
+            impactFluid.w = max(0.0, impactFluid.w - _Dt);
+            if (impactFluid.w <= 0.0) impactFluid.xyz = float3(0.0, 0.0, 0.0);
+            _ImpactFluidState[i] = impactFluid;
+        }
+    }
+#endif
+
+    float4 ps = _ClumpPosState[i];
+    if (ps.w < 0.5) return;
+
+    // Sleeping fragments (settled debris) skip the PHYSICS integration so gravity stops fighting the contact pass
+    // every frame — that tug is what makes a fully-rested pile jitter. The timer in _ClumpVel.w is raised by the
+    // collide pass while the chunk is slow + in contact, and reset there when it loses contact (so it wakes if
+    // disturbed). Aging (below) still runs while asleep, so a settled chunk with a Lifetime dissolves away on
+    // schedule instead of living forever — and stops shedding secondary particles.
+    float stillTime = _ClumpVel[i].w;
+    bool asleep = _SleepDelay > 0.0 && stillTime >= _SleepDelay;
+
+    float3 pos = ps.xyz;
+    float3 vel = _ClumpVel[i].xyz;
+    float3 av = _ClumpAngVel[i].xyz;
+    float4 q = _ClumpRot[i];
+
+    if (asleep)
+    {
+        vel = float3(0.0, 0.0, 0.0);   // frozen pose — no integration, no rest-jitter
+        av  = float3(0.0, 0.0, 0.0);
+    }
+    else
+    {
+        uint seed = hash_u32(i + 1u);
+#if defined(BRAZE_FRACTURE_CLUMP_DATA)
+        float relativeRadius = max(_ImpactClumpCentroid[i].w / max(_AverageClumpRadius, 1e-3), 0.05);
+        float relativeMass = max(_ClumpMassRead[i], 0.05);
+        // Approximate aerodynamic acceleration A/m from bounding area and the real closed-mesh volume.
+        float massResponse = clamp((relativeRadius * relativeRadius) / relativeMass, 0.1, 4.0);
+#else
+        // Surface Disintegrator clumps predate closed-volume mass data. Unit response preserves their authored
+        // force/drag behavior without allocating parallel mass, centroid, or impact-state buffers per part.
+        float massResponse = 1.0;
+#endif
+        apply_forces(vel, pos, seed, massResponse);
+        pos += vel * _Dt;
+        apply_colliders(pos, vel, seed, massResponse);
+
+        float avLen = length(av);
+        if (avLen > 1e-5)
+        {
+            float halfAngle = avLen * _Dt * 0.5;
+            float4 dq = float4((av / avLen) * sin(halfAngle), cos(halfAngle));
+            q = normalize(qmul(dq, q));
+        }
+    }
+
+    float4 life = _ClumpLife[i];
+    float age = life.w + _Dt;
+    float scale = 1.0;
+    float dissolve = 0.0;
+    if (_ClumpLifetime > 0.0)
+    {
+        float lt = saturate(age / _ClumpLifetime);
+        scale = lerp(1.0, 1.0 - _Shrink, lt);
+        dissolve = lt * _Dissolve;
+        if (lt >= 1.0) { scale = 0.0; dissolve = 1.0; }
+    }
+
+    _ClumpPosState[i] = float4(pos, 1.0);
+    _ClumpVel[i] = float4(vel, stillTime);   // keep the collide pass's sleep timer (0 for the disintegrator)
+    _ClumpAngVel[i] = float4(av, 0.0);
+    _ClumpRot[i] = q;
+    _ClumpLife[i] = float4(scale, dissolve, length(vel), age);
+}
+
+[numthreads(64, 1, 1)]
+void SimClumps(uint3 id : SV_DispatchThreadID) { SimClumpsCore(id.x); }
+
+[numthreads(64, 1, 1)]
+void SimSurfaceClumps(uint3 id : SV_DispatchThreadID) { SimClumpsCore(id.x); }

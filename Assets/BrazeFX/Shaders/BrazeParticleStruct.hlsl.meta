@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: d54e41349e3264f8d818d029d9d5ff04
+ShaderIncludeImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Shaders/BrazeParticleStruct.hlsl
+  uploadId: 959622

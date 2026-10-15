@@ -1,0 +1,55 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 1b7b3ffa462274afd96c5e16043d8e98, type: 3}
+  m_Name: Pillar_FractureBake
+  m_EditorClassIdentifier: 
+  signature: dd99d45ef4dcdcb2
+  signatureNoMeshSample: 9445e7ad53e47293
+  inputs:
+    geometryVersion: 6
+    meshFingerprint: 7abc25edd59ab065
+    meshFingerprintNoSample: 5eba4f93b2949db0
+    pointCount: 500
+    seed: 12345
+    fracturePattern: 0
+    patternDirection: {x: 0, y: 1, z: 0}
+    fibreSlenderness: 6
+    secondaryFraction: 0.35
+    impactPoint: {x: 0.011135101, y: 1.1312529, z: 0.0007439256}
+    impactRadius: 0.25
+    radialRings: 5
+    radialRays: 14
+    radialJitter: 0.22
+    radialExtent: 0.92
+    distribution: 0
+    variation: 1
+    clusterCenter: {x: 0, y: 0, z: 0}
+    clusterRadius: 0.5
+    clusterStrength: 0.7
+    clusterFalloff: 2
+    shaderSource: 1
+    noiseScale: 1.35
+    noiseSeed: 7
+    densityContrast: 1.4
+    densityTries: 3
+    neighborK: 96
+    scaleCells: {x: 1, y: 1, z: 1}
+    offsetFragments: 0
+  inputsRecorded: 1
+  fragmentCount: 1062
+  blob: {fileID: 4900000, guid: 94945ae778b4c4c708625c79d545fce3, type: 3}
+  blobVersion: 1
+  seedCount: 500
+  vertexCount: 308520
+  triangleCount: 102840
+  neighborLinkCount: 11278
+  payloadBytes: 11185348

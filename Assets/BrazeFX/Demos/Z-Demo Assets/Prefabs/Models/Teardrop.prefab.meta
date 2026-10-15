@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 56ea8d638311944e0800650c42f6ef7c
+PrefabImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Z-Demo Assets/Prefabs/Models/Teardrop.prefab
+  uploadId: 959622

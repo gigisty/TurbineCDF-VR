@@ -1,0 +1,2612 @@
+// BrazeFX Voronoi Fracture — GPU SEED GENERATION + post-fracture kernels (field break, structural support, collision,
+// settle). One thread per seed scatters a point inside the target bounds (Uniform / Even / Clustered + optional
+// shader-density bias); seeds read back to the CPU, which clips each cell into a closed fragment (BrazeFractureClipper).
+// The remaining kernels run on the per-fragment rigid buffers. Conventions (PCG, hash) mirror BrazeDisintegrateSim.compute.
+#pragma kernel GenSeeds
+#pragma kernel MarkFieldHits
+#pragma kernel MarkUnsupported
+#pragma kernel CollideFragments
+#pragma kernel SettleFragments
+#pragma kernel ApplyEffectors
+#pragma kernel ClearEffectorTransforms
+#pragma kernel ApplySingleEffector
+#pragma kernel PushApartEffector
+#pragma kernel ApplyDelayEffector
+#pragma kernel ApplyDelaySpringEffector
+#pragma kernel SeedCohesiveMotion
+#pragma kernel SolveCohesion
+#pragma kernel ApplyCohesion
+#pragma kernel ClearClusterRelease
+#pragma kernel MarkClusterRelease
+#pragma kernel ExpandClusterRelease
+#pragma kernel IslandLabelInit
+#pragma kernel IslandLabelProp
+#pragma kernel IslandLabelCompress
+#pragma kernel IslandAccumClear
+#pragma kernel IslandAccumCount
+#pragma kernel IslandAccumInertia
+#pragma kernel IslandFinalizeRoots
+#pragma kernel IslandCreateMembersPrepare
+#pragma kernel IslandCreateMembersActivate
+#pragma kernel IslandFrameBegin
+#pragma kernel IslandApplyContacts
+#pragma kernel IslandProject
+#pragma kernel SelfGridClear
+#pragma kernel SelfGridInsert
+#pragma kernel SelfActivateRestPairs
+#pragma kernel SelfCollide
+
+// Must match MaxNb in BrazeVoronoiFracture.cs. Architectural meshes can place many small contact patches on a slab.
+#define MAX_NB 32
+
+// xyz = seed position (LOCAL to the target, i.e. inside [_BoundsMin,_BoundsMax]); w = density weight 0..1.
+RWStructuredBuffer<float4> _Seeds;
+
+uint   _SeedCount;
+uint   _Seed;            // layout seed
+float3 _BoundsMin;       // local-space AABB of the target mesh
+float3 _BoundsMax;
+
+uint   _DistMode;        // 0 = Uniform, 1 = Even (jittered grid), 2 = Clustered
+float  _Variation;       // 0..1 jitter inside even-grid cells
+int3   _GridDims;        // even-grid resolution (product >= _SeedCount)
+
+// Clustered: bias points toward a local-space centre within a radius.
+float3 _ClusterCenter;
+float  _ClusterRadius;
+float  _ClusterStrength; // 0 = uniform, 1 = all points pulled into the cluster
+float  _ClusterFalloff;  // >1 packs tighter to the centre (micro-shatter at the hit point)
+
+// Shader source: bias seeds toward high-density regions of a procedural 3D value-noise field.
+uint   _ShaderSource;    // 0 / 1
+float  _NoiseScale;      // cells per local unit
+uint   _NoiseSeed;
+float  _DensityContrast; // remaps noise; higher = sharper density pockets
+uint   _DensityTries;    // best-candidate count when shader source is on
+
+float3 qsize() { return max(_BoundsMax - _BoundsMin, 1e-5); }
+
+// PCG RXS-M-XS GPU hash: O'Neill PCG family; GPU evaluation by Jarzynski & Olano, JCGT 9(3), 2020.
+float pcg(inout uint state)
+{
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    word = (word >> 22u) ^ word;
+    return float(word) / 4294967296.0;
+}
+
+uint hash_u32(uint x)
+{
+    x ^= x >> 16u; x *= 0x7feb352du;
+    x ^= x >> 15u; x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float3 rand3(inout uint s) { return float3(pcg(s), pcg(s), pcg(s)); }
+
+float3 rand_sphere(inout uint s)
+{
+    float u = pcg(s) * 2.0 - 1.0;
+    float theta = pcg(s) * 6.2831853;
+    float r = sqrt(max(0.0, 1.0 - u * u));
+    return float3(r * cos(theta), r * sin(theta), u);
+}
+
+// 3D value noise (same hash idiom as the Chunk shader), in [0,1].
+float h31(float3 p) { p = frac(p * 0.3183099 + 0.1); p *= 17.0; return frac(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+float vnoise(float3 p)
+{
+    float3 i = floor(p), f = frac(p); f = f * f * (3.0 - 2.0 * f);
+    return lerp(lerp(lerp(h31(i + float3(0,0,0)), h31(i + float3(1,0,0)), f.x),
+                     lerp(h31(i + float3(0,1,0)), h31(i + float3(1,1,0)), f.x), f.y),
+                lerp(lerp(h31(i + float3(0,0,1)), h31(i + float3(1,0,1)), f.x),
+                     lerp(h31(i + float3(0,1,1)), h31(i + float3(1,1,1)), f.x), f.y), f.z);
+}
+
+float density_at(float3 localPos)
+{
+    float3 p = (localPos - _BoundsMin) * _NoiseScale + float(_NoiseSeed) * 19.19;
+    float n = vnoise(p);
+    return saturate(pow(saturate(n), max(_DensityContrast, 0.01)));
+}
+
+// One distribution sample in local space for seed `i` with rng state `s`.
+float3 sample_pos(uint i, inout uint s)
+{
+    float3 lo = _BoundsMin, sz = qsize();
+    float3 result;
+
+    if (_DistMode == 1u)                 // Even — jittered grid
+    {
+        int3 d = max(_GridDims, int3(1, 1, 1));
+        uint gx = i % (uint)d.x;
+        uint gy = (i / (uint)d.x) % (uint)d.y;
+        uint gz = (i / (uint)(d.x * d.y)) % (uint)d.z;
+        float3 cell = (float3(gx, gy, gz) + 0.5 + (rand3(s) - 0.5) * saturate(_Variation)) / float3(d);
+        result = lo + cell * sz;
+    }
+    else if (_DistMode == 2u && pcg(s) < saturate(_ClusterStrength))   // Clustered — bias toward the impact centre
+    {
+        float r = pow(pcg(s), max(_ClusterFalloff, 0.01)) * _ClusterRadius;
+        float3 p = _ClusterCenter + rand_sphere(s) * r;
+        result = clamp(p, _BoundsMin, _BoundsMax);
+    }
+    else                                 // Uniform (and the non-clustered remainder of Clustered)
+    {
+        result = lo + rand3(s) * sz;
+    }
+    return result;
+}
+
+[numthreads(64, 1, 1)]
+void GenSeeds(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _SeedCount) return;
+
+    uint s = hash_u32(i * 0x9e3779b9u ^ (_Seed * 747796405u + 1u));
+
+    float3 best = sample_pos(i, s);
+    float bestW = _ShaderSource != 0u ? density_at(best) : 1.0;
+
+    // Best-candidate: when a shader source is on, keep the densest of a few tries so points crowd the high-density
+    // regions without changing the total count (count stays art-directable).
+    if (_ShaderSource != 0u)
+    {
+        uint tries = min(max(_DensityTries, 1u), 8u);
+        for (uint t = 1u; t < tries; t++)
+        {
+            float3 cand = sample_pos(i, s);
+            float w = density_at(cand);
+            if (w > bestW) { bestW = w; best = cand; }
+        }
+    }
+
+    // Seeds that land outside the mesh are pulled inside on the CPU (RejectSeedsOutside) before the clip-and-cap pass.
+    _Seeds[i] = float4(best, bestW);
+}
+
+// ============================================================================================================
+//  DIRECT-TRANSFORM EFFECTORS — one thread per fragment, evaluated after the rigid simulation. The result is a
+//  non-destructive position / rotation / scale layer consumed by the chunk shader. It never feeds velocity.
+// ============================================================================================================
+
+struct GpuFractureEffector
+{
+    float3 position;       float shape;          // 0 infinite, 1 sphere, 2 box
+    float3 boxHalf;        float radius;
+    float4 rotation;
+    float3 positionAmount; float strength;
+    float3 rotationAmount; float falloffRow;     // radians, xyz
+    float3 scaleAmount;    int auxOffset;
+    int functionType;      int mode;
+    int seed;              int flags;
+    float4 parameters;                          // Random: min, max, noise size, animation speed
+    float4 special0;                            // Function-specific direct-solver data
+    float4 special1;
+};
+
+StructuredBuffer<GpuFractureEffector> _Effectors;
+StructuredBuffer<float> _EffectorFalloff;
+StructuredBuffer<float> _EffectorFunctionLut;
+StructuredBuffer<float4> _EffectorAux;
+StructuredBuffer<float4> _ClumpCentroidE;
+StructuredBuffer<float4> _ClumpPosStateE;
+StructuredBuffer<float4> _ClumpRotE;
+RWStructuredBuffer<float4> _EffectorPosition;
+RWStructuredBuffer<float4> _EffectorRotation;
+RWStructuredBuffer<float4> _EffectorScale;
+RWStructuredBuffer<float4> _EffectorPositionScratch;
+RWStructuredBuffer<float4> _DelayPositionState;
+RWStructuredBuffer<float4> _DelayRotationState;
+RWStructuredBuffer<float4> _DelayScaleState;
+struct DelayVelocityState
+{
+    float4 position;
+    float4 rotation;
+    float4 scale;
+};
+RWStructuredBuffer<DelayVelocityState> _DelayVelocity;
+StructuredBuffer<int> _EffectorNeighbors;
+StructuredBuffer<uint> _EffectorNeighborCounts;
+uint _EffectorCount;
+uint _EffectorClumpCount;
+uint _EffectorIndex;
+uint _DelayHasHistory;
+float _DelayDeltaTime;
+float4x4 _EffectorObjectW2L;
+float4 _EffectorObjectRotation;
+float _EffectorTime;
+float3 _EffectorBoundsMin;
+float3 _EffectorBoundsMax;
+// Zero preserves the original one-dimensional dispatch. GPU cloners set this to dispatch-X * 64 so effector
+// evaluation can span a second dispatch dimension and comfortably cover multi-million-instance layouts.
+uint _DispatchThreadsX;
+
+uint effector_thread_index(uint3 id)
+{
+    return id.x + (_DispatchThreadsX > 0u ? id.y * _DispatchThreadsX : 0u);
+}
+
+#define EF_POSITION       1
+#define EF_ROTATION       2
+#define EF_SCALE          4
+#define EF_UNIFORM_SCALE  8
+#define EF_SYNCHRONIZED  16
+#define EF_INDEXED       32
+#define EF_OBJECT_SPACE  64
+#define EF_EFFECTOR_SPACE 128
+#define EF_STEP_REVERSE  256
+#define EF_STEP_LOOP     512
+#define EF_TARGET_PITCH  1024
+#define EF_TARGET_REPEL  2048
+#define EF_SPLINE_LOOP   4096
+#define EF_SHADER_INVERT 8192
+#define EF_SHADER_ABSOLUTE 16384
+
+float3 qrote(float4 q, float3 v) { return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
+float4 qmule(float4 a, float4 b)
+{
+    return float4(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz), a.w * b.w - dot(a.xyz, b.xyz));
+}
+
+float4 qconje(float4 q) { return float4(-q.xyz, q.w); }
+
+float4 qnlerpe(float4 a, float4 b, float t)
+{
+    if (dot(a, b) < 0.0) b = -b;
+    return normalize(lerp(a, b, saturate(t)));
+}
+
+float4 quat_from_basis(float3 right, float3 up, float3 forward)
+{
+    float m00 = right.x,   m01 = up.x,      m02 = forward.x;
+    float m10 = right.y,   m11 = up.y,      m12 = forward.y;
+    float m20 = right.z,   m21 = up.z,      m22 = forward.z;
+    float4 q;
+    float trace = m00 + m11 + m22;
+    if (trace > 0.0)
+    {
+        float s = sqrt(trace + 1.0) * 2.0;
+        q = float4((m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25 * s);
+    }
+    else if (m00 > m11 && m00 > m22)
+    {
+        float s = sqrt(max(1.0 + m00 - m11 - m22, 1e-8)) * 2.0;
+        q = float4(0.25 * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s);
+    }
+    else if (m11 > m22)
+    {
+        float s = sqrt(max(1.0 + m11 - m00 - m22, 1e-8)) * 2.0;
+        q = float4((m01 + m10) / s, 0.25 * s, (m12 + m21) / s, (m02 - m20) / s);
+    }
+    else
+    {
+        float s = sqrt(max(1.0 + m22 - m00 - m11, 1e-8)) * 2.0;
+        q = float4((m02 + m20) / s, (m12 + m21) / s, 0.25 * s, (m10 - m01) / s);
+    }
+    return normalize(q);
+}
+
+float4 target_axis_correction(int axis)
+{
+    const float h = 0.707106781;
+    float4 correction = float4(0, 0, 0, 1);
+    if (axis == 1) correction = float4(0, 1, 0, 0);       // -Z to +Z
+    else if (axis == 2) correction = float4(h, 0, 0, h);  // +Y to +Z
+    else if (axis == 3) correction = float4(-h, 0, 0, h); // -Y to +Z
+    else if (axis == 4) correction = float4(0, -h, 0, h); // +X to +Z
+    else if (axis == 5) correction = float4(0, h, 0, h);  // -X to +Z
+    return correction;
+}
+
+void apply_target_effector(GpuFractureEffector e, float w, float4 baseRotation,
+                           inout float3 pivot, inout float3 positionResult,
+                           inout float4 rotationResult)
+{
+    float3 target = e.special0.xyz;
+    float3 up = normalize(e.special1.xyz);
+    float4 currentWorld = normalize(qmule(rotationResult, baseRotation));
+
+    if ((e.flags & EF_TARGET_REPEL) != 0 && e.special0.w > 0.0 && e.special1.w > 0.0)
+    {
+        float3 away = pivot - target;
+        float distanceToTarget = length(away);
+        if (distanceToTarget < e.special0.w)
+        {
+            away = distanceToTarget > 1e-6 ? away / distanceToTarget : qrote(currentWorld, float3(0, 0, 1));
+            float3 delta = normalize(away) * (e.special0.w - distanceToTarget) * e.special1.w * w;
+            positionResult += delta;
+            pivot += delta;
+        }
+    }
+
+    float3 direction = target - pivot;
+    if ((e.flags & EF_TARGET_PITCH) == 0)
+    {
+        direction -= up * dot(direction, up);
+        if (dot(direction, direction) <= 1e-8)
+        {
+            direction = qrote(currentWorld, float3(0, 0, 1));
+            direction -= up * dot(direction, up);
+        }
+    }
+    if (dot(direction, direction) <= 1e-8) return;
+    direction = normalize(direction);
+
+    if (abs(dot(direction, up)) > 0.999)
+    {
+        up = qrote(currentWorld, float3(0, 1, 0));
+        up -= direction * dot(up, direction);
+    }
+    if (dot(up, up) <= 1e-8)
+        up = cross(direction, abs(direction.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0));
+    up = normalize(up);
+
+    float3 right = normalize(cross(up, direction));
+    float3 stableUp = cross(direction, right);
+    float4 look = quat_from_basis(right, stableUp, direction);
+    float4 desiredWorld = normalize(qmule(look, target_axis_correction(e.mode)));
+    float4 blendedWorld = qnlerpe(currentWorld, desiredWorld, w);
+    rotationResult = normalize(qmule(blendedWorld, qconje(baseRotation)));
+}
+
+float4 euler_quat(float3 a)
+{
+    float3 h = a * 0.5;
+    float3 s = sin(h), c = cos(h);
+    float4 qx = float4(s.x, 0, 0, c.x);
+    float4 qy = float4(0, s.y, 0, c.y);
+    float4 qz = float4(0, 0, s.z, c.z);
+    return normalize(qmule(qz, qmule(qy, qx)));
+}
+
+float spline_parameter(GpuFractureEffector e, float u)
+{
+    return (e.flags & EF_SPLINE_LOOP) != 0 ? frac(u) : saturate(u);
+}
+
+float3 sample_spline_path(GpuFractureEffector e, float u)
+{
+    int count = (int)round(e.parameters.w);
+    float3 result = float3(0, 0, 0);
+    if (count >= 2)
+    {
+        u = spline_parameter(e, u);
+        float f = u * float(count - 1);
+        int i0 = min((int)floor(f), count - 2);
+        int i1 = i0 + 1;
+        result = lerp(_EffectorAux[e.seed + i0].xyz, _EffectorAux[e.seed + i1].xyz, f - float(i0));
+    }
+    return result;
+}
+
+void apply_spline_effector(GpuFractureEffector e, float w, uint fragmentId, float4 baseRotation,
+                           inout float3 pivot, inout float3 positionResult,
+                           inout float4 rotationResult)
+{
+    int count = (int)round(e.parameters.w);
+    if (count < 2) return;
+
+    float3 objectPosition = mul(_EffectorObjectW2L, float4(pivot, 1.0)).xyz;
+    float3 size = max(_EffectorBoundsMax - _EffectorBoundsMin, float3(1e-5, 1e-5, 1e-5));
+    float3 normalized = (objectPosition - _EffectorBoundsMin) / size;
+    float raw;
+    if (e.mode == 1) raw = normalized.x;
+    else if (e.mode == 2) raw = normalized.y;
+    else if (e.mode == 3) raw = normalized.z;
+    else if (e.mode == 4) raw = length(normalized * 2.0 - 1.0) * 0.577350269;
+    else raw = _EffectorClumpCount > 1u ? float(fragmentId) / float(_EffectorClumpCount - 1u) : 0.0;
+
+    float u = lerp(e.parameters.x, e.parameters.y, raw) + e.parameters.z;
+    u = spline_parameter(e, u);
+    float3 pathPosition = sample_spline_path(e, u);
+    float4 currentWorld = normalize(qmule(rotationResult, baseRotation));
+    float4 frame = currentWorld;
+    bool hasTangent = false;
+    float stepSize = 1.0 / float(max(count - 1, 1));
+    float3 tangent = sample_spline_path(e, u + stepSize) - sample_spline_path(e, u - stepSize);
+    if (e.parameters.y < e.parameters.x) tangent = -tangent;
+    if (dot(tangent, tangent) > 1e-8)
+    {
+        hasTangent = true;
+        float3 direction = normalize(tangent);
+        float3 up = normalize(e.special0.xyz);
+        if (abs(dot(direction, up)) > 0.999)
+        {
+            up = qrote(currentWorld, float3(0, 1, 0));
+            up -= direction * dot(up, direction);
+        }
+        if (dot(up, up) <= 1e-8)
+            up = cross(direction, abs(direction.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0));
+        up = normalize(up);
+
+        float3 right = normalize(cross(up, direction));
+        float3 stableUp = cross(direction, right);
+        frame = quat_from_basis(right, stableUp, direction);
+    }
+
+    if ((e.flags & EF_POSITION) != 0)
+    {
+        float3 targetPosition = pathPosition + qrote(frame, e.positionAmount);
+        float3 delta = (targetPosition - pivot) * w;
+        positionResult += delta;
+        pivot += delta;
+    }
+
+    if ((e.flags & EF_ROTATION) == 0 || !hasTangent) return;
+    float4 correction = target_axis_correction((int)round(e.special0.w));
+    float4 desiredWorld = normalize(qmule(frame, qmule(correction, euler_quat(e.special1.xyz))));
+    float4 blendedWorld = qnlerpe(currentWorld, desiredWorld, w);
+    rotationResult = normalize(qmule(blendedWorld, qconje(baseRotation)));
+}
+
+float effector_shape_distance(GpuFractureEffector e, float3 p, uint shape)
+{
+    const float epsilon = 1e-5;
+    float result = 0.0;
+    if (shape == 1u)
+    {
+        result = distance(p, e.position) / max(e.radius, epsilon);
+    }
+    else
+    {
+        float4 invQ = float4(-e.rotation.xyz, e.rotation.w);
+        float3 lp = qrote(invQ, p - e.position);
+        if (shape == 2u || shape == 7u)
+        {
+            result = max(max(abs(lp.x) / max(e.boxHalf.x, epsilon),
+                             abs(lp.y) / max(e.boxHalf.y, epsilon)),
+                             abs(lp.z) / max(e.boxHalf.z, epsilon));
+        }
+        else if (shape == 3u)
+        {
+            float capsuleRadius = max(e.radius, epsilon);
+            float halfHeight = max(e.boxHalf.y, capsuleRadius);
+            float segment = max(halfHeight - capsuleRadius, 0.0);
+            float3 capsulePoint = float3(lp.x, max(abs(lp.y) - segment, 0.0), lp.z);
+            result = length(capsulePoint) / capsuleRadius;
+        }
+        else if (shape == 4u)
+        {
+            float radial = length(lp.xz) / max(e.radius, epsilon);
+            float vertical = abs(lp.y) / max(e.boxHalf.y, epsilon);
+            result = max(radial, vertical);
+        }
+        else if (shape == 5u)
+        {
+            float halfHeight = max(e.boxHalf.y, epsilon);
+            float height01 = saturate((lp.y + halfHeight) / (2.0 * halfHeight));
+            float availableRadius = max(e.radius * (1.0 - height01), epsilon);
+            float radial = length(lp.xz) / availableRadius;
+            float vertical = abs(lp.y) / halfHeight;
+            result = max(radial, vertical);
+        }
+        else if (shape == 6u)
+        {
+            float tubeDistance = length(float2(length(lp.xz) - e.radius, lp.y));
+            result = tubeDistance / max(e.boxHalf.x, epsilon);
+        }
+    }
+    return result;
+}
+
+float effector_weight(GpuFractureEffector e, float3 p)
+{
+    uint shape = (uint)round(e.shape);
+    float result = e.strength;
+    float t = 0.0;
+    if (shape != 0u) t = effector_shape_distance(e, p, shape);
+    if (shape != 0u)
+    {
+        float x = saturate(t) * 255.0;
+        uint x0 = (uint)floor(x), x1 = min(x0 + 1u, 255u);
+        uint row = (uint)max(e.falloffRow, 0.0) * 256u;
+        float curve = lerp(_EffectorFalloff[row + x0], _EffectorFalloff[row + x1], frac(x));
+        result = t > 1.0 ? 0.0 : curve * e.strength;
+    }
+    return result;
+}
+
+struct EffectorSamples
+{
+    float3 position;
+    float3 rotation;
+    float3 scale;
+};
+
+float remap_random(GpuFractureEffector e, float v01) { return lerp(e.parameters.x, e.parameters.y, v01); }
+
+float random_scalar(inout uint state, int mode)
+{
+    float result = 0.0;
+    if (mode == 1) // Gaussian-ish: averaging four uniform samples concentrates values near the middle
+        result = (pcg(state) + pcg(state) + pcg(state) + pcg(state)) * 0.25;
+    else
+        result = pcg(state);
+    return result;
+}
+
+float3 random_vector(GpuFractureEffector e, uint baseSeed, uint channel)
+{
+    uint state = hash_u32(baseSeed ^ (channel + 1u) * 0x27d4eb2du);
+    float3 result = float3(0, 0, 0);
+    if ((e.flags & EF_INDEXED) == 0)
+    {
+        float v = remap_random(e, random_scalar(state, e.mode));
+        result = v.xxx;
+    }
+    else
+    {
+        float x = remap_random(e, random_scalar(state, e.mode));
+        float y = remap_random(e, random_scalar(state, e.mode));
+        float z = remap_random(e, random_scalar(state, e.mode));
+        result = float3(x, y, z);
+    }
+    return result;
+}
+
+float eff_lattice(int3 p)
+{
+    uint h = hash_u32(asuint(p.x) * 0x8da6b343u ^ asuint(p.y) * 0xd8163841u ^ asuint(p.z) * 0xcb1ab31fu);
+    return float(h & 0x00ffffffu) / 16777216.0;
+}
+
+float eff_value_noise(float3 p)
+{
+    int3 i = (int3)floor(p);
+    float3 f = frac(p); f = f * f * (3.0 - 2.0 * f);
+    return lerp(lerp(lerp(eff_lattice(i + int3(0,0,0)), eff_lattice(i + int3(1,0,0)), f.x),
+                     lerp(eff_lattice(i + int3(0,1,0)), eff_lattice(i + int3(1,1,0)), f.x), f.y),
+                lerp(lerp(eff_lattice(i + int3(0,0,1)), eff_lattice(i + int3(1,0,1)), f.x),
+                     lerp(eff_lattice(i + int3(0,1,1)), eff_lattice(i + int3(1,1,1)), f.x), f.y), f.z);
+}
+
+float eff_noise_scalar(GpuFractureEffector e, float3 p, int channel)
+{
+    float3 offset = float3(e.seed * 0.137 + channel * 19.19,
+                           e.seed * 0.173 + channel * 7.73,
+                           e.seed * 0.199 + channel * 13.37);
+    p += offset;
+    float result = 0.0;
+    if (e.mode == 2)
+        result = eff_value_noise(p); // Noise
+    else
+    {
+        float sum = 0.0, amplitude = 0.5, frequency = 1.0, normalization = 0.0;
+        [unroll] for (int octave = 0; octave < 4; octave++)
+        {
+            sum += eff_value_noise(p * frequency) * amplitude;
+            normalization += amplitude;
+            frequency *= 2.03;
+            amplitude *= 0.5;
+        }
+        result = normalization > 0.0 ? sum / normalization : 0.5;
+    }
+    return result;
+}
+
+float3 noise_vector(GpuFractureEffector e, float3 p, int channel)
+{
+    float3 result = float3(0, 0, 0);
+    if ((e.flags & EF_INDEXED) == 0)
+    {
+        float v = remap_random(e, eff_noise_scalar(e, p, channel));
+        result = v.xxx;
+    }
+    else
+    {
+        result = float3(remap_random(e, eff_noise_scalar(e, p, channel * 3)),
+                        remap_random(e, eff_noise_scalar(e, p, channel * 3 + 1)),
+                        remap_random(e, eff_noise_scalar(e, p, channel * 3 + 2)));
+    }
+    return result;
+}
+
+EffectorSamples sample_random_effector(GpuFractureEffector e, uint fragmentId, uint stackIndex, float3 pivot)
+{
+    EffectorSamples result;
+    result.position = 0; result.rotation = 0; result.scale = 0;
+    uint baseSeed = hash_u32(fragmentId * 0x9e3779b9u ^ asuint(e.seed) ^ stackIndex * 0x85ebca6bu);
+    bool spatial = e.mode >= 2;
+    float3 samplePosition = (e.flags & EF_OBJECT_SPACE) != 0
+        ? mul(_EffectorObjectW2L, float4(pivot, 1.0)).xyz : pivot;
+    float3 p = samplePosition / max(e.parameters.z, 0.001);
+    p += (_EffectorTime * e.parameters.w).xxx;
+    float3 first = spatial ? noise_vector(e, p, 0) : random_vector(e, baseSeed, 0u);
+    if ((e.flags & EF_SYNCHRONIZED) != 0)
+    {
+        result.position = first; result.rotation = first; result.scale = first;
+    }
+    else
+    {
+        result.position = first;
+        result.rotation = spatial ? noise_vector(e, p, 1) : random_vector(e, baseSeed, 1u);
+        result.scale = spatial ? noise_vector(e, p, 2) : random_vector(e, baseSeed, 2u);
+    }
+    return result;
+}
+
+float sample_function_curve(uint row, float t)
+{
+    float x = saturate(t) * 255.0;
+    uint x0 = (uint)floor(x), x1 = min(x0 + 1u, 255u);
+    uint offset = row * 256u;
+    return lerp(_EffectorFunctionLut[offset + x0], _EffectorFunctionLut[offset + x1], frac(x));
+}
+
+EffectorSamples sample_step_effector(GpuFractureEffector e, uint fragmentId, uint stackIndex, float3 pivot)
+{
+    float3 objectPosition = mul(_EffectorObjectW2L, float4(pivot, 1.0)).xyz;
+    float3 size = max(_EffectorBoundsMax - _EffectorBoundsMin, float3(1e-5, 1e-5, 1e-5));
+    float3 normalized = (objectPosition - _EffectorBoundsMin) / size;
+    float raw;
+    if (e.mode == 1) raw = normalized.x;
+    else if (e.mode == 2) raw = normalized.y;
+    else if (e.mode == 3) raw = normalized.z;
+    else if (e.mode == 4) raw = length(normalized * 2.0 - 1.0) * 0.577350269;
+    else raw = _EffectorClumpCount > 1u ? float(fragmentId) / float(_EffectorClumpCount - 1u) : 0.0;
+
+    float denom = e.parameters.y - e.parameters.x;
+    float t = abs(denom) > 1e-6 ? (raw - e.parameters.x) / denom : 0.0;
+    t += e.parameters.z;
+    t = (e.flags & EF_STEP_LOOP) != 0 ? frac(t) : saturate(t);
+    if ((e.flags & EF_STEP_REVERSE) != 0) t = 1.0 - t;
+    int steps = (int)round(e.parameters.w);
+    if (steps > 1) t = round(t * float(steps - 1)) / float(steps - 1);
+    float value = sample_function_curve(stackIndex, t);
+
+    EffectorSamples result;
+    result.position = value.xxx;
+    result.rotation = value.xxx;
+    result.scale = value.xxx;
+    return result;
+}
+
+float shader_lattice(int3 p, int timeSlice, int seed)
+{
+    uint h = hash_u32(asuint(p.x) * 0x8da6b343u ^ asuint(p.y) * 0xd8163841u
+                      ^ asuint(p.z) * 0xcb1ab31fu ^ asuint(timeSlice) * 0x9e3779b9u
+                      ^ asuint(seed) * 0x85ebca6bu);
+    return float(h & 0x00ffffffu) / 16777216.0;
+}
+
+float shader_noise_slice(int3 p, int timeSlice, int seed, float3 f)
+{
+    float c000 = shader_lattice(p + int3(0,0,0), timeSlice, seed);
+    float c100 = shader_lattice(p + int3(1,0,0), timeSlice, seed);
+    float c010 = shader_lattice(p + int3(0,1,0), timeSlice, seed);
+    float c110 = shader_lattice(p + int3(1,1,0), timeSlice, seed);
+    float c001 = shader_lattice(p + int3(0,0,1), timeSlice, seed);
+    float c101 = shader_lattice(p + int3(1,0,1), timeSlice, seed);
+    float c011 = shader_lattice(p + int3(0,1,1), timeSlice, seed);
+    float c111 = shader_lattice(p + int3(1,1,1), timeSlice, seed);
+    return lerp(lerp(lerp(c000, c100, f.x), lerp(c010, c110, f.x), f.y),
+                lerp(lerp(c001, c101, f.x), lerp(c011, c111, f.x), f.y), f.z);
+}
+
+float shader_value_noise(float3 p, float evolution, int seed)
+{
+    int3 cell = (int3)floor(p);
+    float3 f = frac(p); f = f * f * (3.0 - 2.0 * f);
+    int timeSlice = (int)floor(evolution);
+    float ft = frac(evolution); ft = ft * ft * (3.0 - 2.0 * ft);
+    return lerp(shader_noise_slice(cell, timeSlice, seed, f),
+                shader_noise_slice(cell, timeSlice + 1, seed, f), ft);
+}
+
+float3 shader_noise_position(GpuFractureEffector e, float3 pivot)
+{
+    int space = e.mode >> 3;
+    float3 p;
+    if (space == 2) p = pivot;
+    else if (space == 1) p = mul(_EffectorObjectW2L, float4(pivot, 1.0)).xyz;
+    else p = qrote(qconje(e.rotation), pivot - e.position);
+
+    float4 coordinateData = _EffectorAux[e.auxOffset + 1];
+    float movementLength = length(e.special1.xyz);
+    float3 direction = movementLength > 1e-6 ? e.special1.xyz / movementLength : float3(0, 0, 0);
+    p += coordinateData.xyz + direction * (e.special1.w * _EffectorTime);
+    float3 featureSize = max(e.parameters.x * e.special0.xyz, float3(0.001, 0.001, 0.001));
+    return p / featureSize;
+}
+
+float shader_fractal_noise(GpuFractureEffector e, float3 p)
+{
+    int noiseType = e.mode & 7;
+    int layerCount = noiseType == 0 ? 1 : clamp((int)round(e.parameters.y), 1, 8);
+    float sum = 0.0, normalization = 0.0, amplitude = 1.0, frequency = 1.0;
+    [unroll] for (int octave = 0; octave < 8; octave++)
+    {
+        if (octave >= layerCount) break;
+        float n = shader_value_noise(p * frequency, _EffectorTime * e.special0.w, e.seed + octave * 1013);
+        if (noiseType == 2) n = abs(n * 2.0 - 1.0);
+        else if (noiseType == 3)
+        {
+            n = 1.0 - abs(n * 2.0 - 1.0);
+            n *= n;
+        }
+        sum += n * amplitude;
+        normalization += amplitude;
+        frequency *= max(e.parameters.w, 1.01);
+        amplitude *= saturate(e.parameters.z);
+    }
+    return normalization > 1e-6 ? sum / normalization : 0.5;
+}
+
+float shader_clip(float value, float low, float high)
+{
+    float range = high - low;
+    float result = value >= high ? 1.0 : 0.0;
+    if (abs(range) > 1e-6) result = saturate((value - low) / range);
+    return result;
+}
+
+EffectorSamples sample_shader_effector(GpuFractureEffector e, uint stackIndex, float3 pivot)
+{
+    float value = shader_fractal_noise(e, shader_noise_position(e, pivot));
+    if ((e.flags & EF_SHADER_ABSOLUTE) != 0) value = abs(value * 2.0 - 1.0);
+    float4 outputData = _EffectorAux[e.auxOffset];
+    value = shader_clip(value, outputData.x, outputData.y);
+    value = saturate((value - 0.5) * (1.0 + outputData.w) + 0.5 + outputData.z);
+    if ((e.flags & EF_SHADER_INVERT) != 0) value = 1.0 - value;
+    value = sample_function_curve(stackIndex, value);
+
+    EffectorSamples result;
+    result.position = value.xxx;
+    result.rotation = value.xxx;
+    result.scale = value.xxx;
+    return result;
+}
+
+EffectorSamples sample_plane_effector()
+{
+    // The Plane effector is the cheapest sample source: one constant transform value. Spatial selection,
+    // curve falloff, signed strength, and transform-space conversion stay in the shared GPU stack below.
+    EffectorSamples result;
+    result.position = 1.0;
+    result.rotation = 1.0;
+    result.scale = 1.0;
+    return result;
+}
+
+EffectorSamples sample_effector(GpuFractureEffector e, uint fragmentId, uint stackIndex, float3 pivot)
+{
+    EffectorSamples result; result.position = 0; result.rotation = 0; result.scale = 0;
+    if (e.functionType == 0) result = sample_random_effector(e, fragmentId, stackIndex, pivot);
+    else if (e.functionType == 1) result = sample_step_effector(e, fragmentId, stackIndex, pivot);
+    else if (e.functionType == 4) result = sample_shader_effector(e, stackIndex, pivot);
+    else if (e.functionType == 7) result = sample_plane_effector();
+    return result;
+}
+
+// Retained for compute-kernel table compatibility with existing imported BrazeVoronoi assets. The runtime uses
+// ClearEffectorTransforms + ApplySingleEffector so ordered stacks can include the iterative Push Apart pass.
+[numthreads(64, 1, 1)]
+void ApplyEffectors(uint3 id : SV_DispatchThreadID)
+{
+    uint c = effector_thread_index(id);
+    if (c >= _EffectorClumpCount) return;
+
+    float4 ps = _ClumpPosStateE[c];
+    float3 pivot = ps.w < 0.5 ? _ClumpCentroidE[c].xyz : ps.xyz;
+    float3 positionResult = float3(0, 0, 0);
+    float4 rotationResult = float4(0, 0, 0, 1);
+    float3 scaleResult = float3(1, 1, 1);
+    float influenceResult = 0.0;
+    float4 baseRotation = ps.w < 0.5 ? normalize(_EffectorObjectRotation) : normalize(_ClumpRotE[c]);
+
+    [loop] for (uint i = 0u; i < _EffectorCount; i++)
+    {
+        GpuFractureEffector e = _Effectors[i];
+        float w = effector_weight(e, pivot);
+        // Push Apart (function 5) is handled by its iterative kernel and never authors appearance influence here.
+        if (e.functionType != 5) influenceResult = max(influenceResult, abs(w));
+        if (abs(w) <= 1e-6) continue;
+
+        if (e.functionType == 2)
+        {
+            apply_target_effector(e, w, baseRotation, pivot, positionResult, rotationResult);
+            continue;
+        }
+        if (e.functionType == 3)
+        {
+            apply_spline_effector(e, w, c, baseRotation, pivot, positionResult, rotationResult);
+            continue;
+        }
+
+        EffectorSamples sample = sample_effector(e, c, i, pivot);
+        bool localSpace = (e.flags & EF_EFFECTOR_SPACE) != 0;
+        float4 frame = localSpace ? e.rotation : float4(0, 0, 0, 1);
+        float4 invFrame = float4(-frame.xyz, frame.w);
+
+        if ((e.flags & EF_POSITION) != 0)
+        {
+            float3 delta = qrote(frame, sample.position * e.positionAmount) * w;
+            positionResult += delta;
+            pivot += delta;
+        }
+        if ((e.flags & EF_ROTATION) != 0)
+        {
+            float4 q = qmule(frame, qmule(euler_quat(sample.rotation * e.rotationAmount * w), invFrame));
+            rotationResult = normalize(qmule(q, rotationResult));
+        }
+        if ((e.flags & EF_SCALE) != 0)
+        {
+            float3 scaleSample = (e.flags & EF_UNIFORM_SCALE) != 0 ? sample.scale.xxx : sample.scale;
+            float3 targetScale = max(float3(0.001, 0.001, 0.001), 1.0 + scaleSample * e.scaleAmount);
+            scaleResult *= lerp(float3(1, 1, 1), targetScale, w);
+        }
+    }
+
+    _EffectorPosition[c] = float4(positionResult, influenceResult);
+    _EffectorRotation[c] = rotationResult;
+    _EffectorScale[c] = float4(scaleResult, 0.0);
+}
+
+float3 effector_base_pivot(uint c)
+{
+    float4 ps = _ClumpPosStateE[c];
+    return ps.w < 0.5 ? _ClumpCentroidE[c].xyz : ps.xyz;
+}
+
+[numthreads(64, 1, 1)]
+void ClearEffectorTransforms(uint3 id : SV_DispatchThreadID)
+{
+    uint c = effector_thread_index(id);
+    if (c >= _EffectorClumpCount) return;
+    _EffectorPosition[c] = float4(0, 0, 0, 0);
+    _EffectorRotation[c] = float4(0, 0, 0, 1);
+    _EffectorScale[c] = float4(1, 1, 1, 0);
+}
+
+[numthreads(64, 1, 1)]
+void ApplySingleEffector(uint3 id : SV_DispatchThreadID)
+{
+    uint c = effector_thread_index(id);
+    if (c >= _EffectorClumpCount || _EffectorIndex >= _EffectorCount) return;
+
+    float4 ps = _ClumpPosStateE[c];
+    float3 positionResult = _EffectorPosition[c].xyz;
+    float influenceResult = _EffectorPosition[c].w;
+    float4 rotationResult = _EffectorRotation[c];
+    float3 scaleResult = _EffectorScale[c].xyz;
+    float3 pivot = effector_base_pivot(c) + positionResult;
+    float4 baseRotation = ps.w < 0.5 ? normalize(_EffectorObjectRotation) : normalize(_ClumpRotE[c]);
+    GpuFractureEffector e = _Effectors[_EffectorIndex];
+    float w = effector_weight(e, pivot);
+    if (e.functionType != 5) influenceResult = max(influenceResult, abs(w));
+    if (abs(w) > 1e-6)
+    {
+        if (e.functionType == 2)
+            apply_target_effector(e, w, baseRotation, pivot, positionResult, rotationResult);
+        else if (e.functionType == 3)
+            apply_spline_effector(e, w, c, baseRotation, pivot, positionResult, rotationResult);
+        else if (e.functionType != 5 && e.functionType != 6)
+        {
+            EffectorSamples sample = sample_effector(e, c, _EffectorIndex, pivot);
+            bool localSpace = (e.flags & EF_EFFECTOR_SPACE) != 0;
+            float4 frame = localSpace ? e.rotation : float4(0, 0, 0, 1);
+            float4 invFrame = float4(-frame.xyz, frame.w);
+
+            if ((e.flags & EF_POSITION) != 0)
+                positionResult += qrote(frame, sample.position * e.positionAmount) * w;
+            if ((e.flags & EF_ROTATION) != 0)
+            {
+                float4 q = qmule(frame, qmule(euler_quat(sample.rotation * e.rotationAmount * w), invFrame));
+                rotationResult = normalize(qmule(q, rotationResult));
+            }
+            if ((e.flags & EF_SCALE) != 0)
+            {
+                float3 scaleSample = (e.flags & EF_UNIFORM_SCALE) != 0 ? sample.scale.xxx : sample.scale;
+                float3 targetScale = max(float3(0.001, 0.001, 0.001), 1.0 + scaleSample * e.scaleAmount);
+                scaleResult *= lerp(float3(1, 1, 1), targetScale, w);
+            }
+        }
+    }
+
+    _EffectorPosition[c] = float4(positionResult, influenceResult);
+    _EffectorRotation[c] = rotationResult;
+    _EffectorScale[c] = float4(scaleResult, 0.0);
+}
+
+float3 delay_move_towards(float3 current, float3 target, float maximumDelta)
+{
+    float3 delta = target - current;
+    float distanceToTarget = length(delta);
+    return distanceToTarget <= maximumDelta || distanceToTarget <= 1e-7
+        ? target : current + delta * (maximumDelta / distanceToTarget);
+}
+
+float4 delay_nlerp(float4 current, float4 target, float amount)
+{
+    if (dot(current, target) < 0.0) target = -target;
+    float4 value = lerp(current, target, saturate(amount));
+    float lengthSq = dot(value, value);
+    return lengthSq > 1e-10 ? value * rsqrt(lengthSq) : float4(0, 0, 0, 1);
+}
+
+float4 delay_rotate_towards(float4 current, float4 target, float maximumAngle)
+{
+    float cosine = dot(current, target);
+    if (cosine < 0.0) { target = -target; cosine = -cosine; }
+    float angle = 2.0 * acos(clamp(cosine, 0.0, 1.0));
+    float amount = angle > 1e-6 ? min(1.0, maximumAngle / angle) : 1.0;
+    return delay_nlerp(current, target, amount);
+}
+
+// C4D-style Even and Blend modes. This kernel stores only three float4 values per clone; the more expensive
+// velocity buffers are reserved for Spring mode.
+[numthreads(64, 1, 1)]
+void ApplyDelayEffector(uint3 id : SV_DispatchThreadID)
+{
+    uint c = effector_thread_index(id);
+    if (c >= _EffectorClumpCount || _EffectorIndex >= _EffectorCount) return;
+
+    GpuFractureEffector e = _Effectors[_EffectorIndex];
+    float4 targetPositionData = _EffectorPosition[c];
+    float3 targetPosition = targetPositionData.xyz;
+    float4 targetRotation = normalize(_EffectorRotation[c]);
+    float3 targetScale = _EffectorScale[c].xyz;
+    float3 pivot = effector_base_pivot(c) + targetPosition;
+    float fieldWeight = effector_weight(e, pivot);
+    float amount = saturate(abs(fieldWeight));
+
+    float3 statePosition = _DelayHasHistory != 0u ? _DelayPositionState[c].xyz : targetPosition;
+    float4 stateRotation = _DelayHasHistory != 0u ? normalize(_DelayRotationState[c]) : targetRotation;
+    float3 stateScale = _DelayHasHistory != 0u ? _DelayScaleState[c].xyz : targetScale;
+
+    if (_DelayHasHistory == 0u || amount <= 1e-5)
+    {
+        statePosition = targetPosition;
+        stateRotation = targetRotation;
+        stateScale = targetScale;
+    }
+    else
+    {
+        float duration = lerp(0.005, 0.55, amount);
+        if (e.mode == 0) // Even: constant travel through normalized transform space.
+        {
+            float normalizedStep = max(0.0, _DelayDeltaTime) / duration;
+            float positionReference = max(1.0, max(length(statePosition), length(targetPosition)));
+            float scaleReference = max(1.0, max(length(stateScale - 1.0), length(targetScale - 1.0)));
+            statePosition = delay_move_towards(statePosition, targetPosition, normalizedStep * positionReference);
+            stateRotation = delay_rotate_towards(stateRotation, targetRotation, normalizedStep * 3.14159265);
+            stateScale = delay_move_towards(stateScale, targetScale, normalizedStep * scaleReference);
+        }
+        else // Blend: large differences close quickly, then ease smoothly into the target.
+        {
+            float response = 1.0 - exp(-max(0.0, _DelayDeltaTime) / duration);
+            statePosition = lerp(statePosition, targetPosition, response);
+            stateRotation = delay_nlerp(stateRotation, targetRotation, response);
+            stateScale = lerp(stateScale, targetScale, response);
+        }
+    }
+
+    _DelayPositionState[c] = float4(statePosition, 0.0);
+    _DelayRotationState[c] = stateRotation;
+    _DelayScaleState[c] = float4(stateScale, 0.0);
+    // Delay is a transform-only temporal filter. Preserve the influence authored by effectors above it;
+    // its own field weight must never mark clones as colour-affected.
+    _EffectorPosition[c] = float4(statePosition, targetPositionData.w);
+    _EffectorRotation[c] = stateRotation;
+    _EffectorScale[c] = float4(stateScale, 0.0);
+}
+
+// Spring is a damped second-order response. Higher Delay strength lowers the frequency and damping ratio, matching
+// C4D's softer, longer residual oscillation at larger values. Two bounded substeps keep editor repaint gaps stable.
+[numthreads(64, 1, 1)]
+void ApplyDelaySpringEffector(uint3 id : SV_DispatchThreadID)
+{
+    uint c = effector_thread_index(id);
+    if (c >= _EffectorClumpCount || _EffectorIndex >= _EffectorCount) return;
+
+    GpuFractureEffector e = _Effectors[_EffectorIndex];
+    float4 targetPositionData = _EffectorPosition[c];
+    float3 targetPosition = targetPositionData.xyz;
+    float4 targetRotation = normalize(_EffectorRotation[c]);
+    float3 targetScale = _EffectorScale[c].xyz;
+    float3 pivot = effector_base_pivot(c) + targetPosition;
+    float fieldWeight = effector_weight(e, pivot);
+    float amount = saturate(abs(fieldWeight));
+
+    float3 statePosition = _DelayHasHistory != 0u ? _DelayPositionState[c].xyz : targetPosition;
+    float4 stateRotation = _DelayHasHistory != 0u ? normalize(_DelayRotationState[c]) : targetRotation;
+    float3 stateScale = _DelayHasHistory != 0u ? _DelayScaleState[c].xyz : targetScale;
+    DelayVelocityState velocityState = _DelayVelocity[c];
+    float3 positionVelocity = _DelayHasHistory != 0u ? velocityState.position.xyz : 0.0;
+    float4 rotationVelocity = _DelayHasHistory != 0u ? velocityState.rotation : 0.0;
+    float3 scaleVelocity = _DelayHasHistory != 0u ? velocityState.scale.xyz : 0.0;
+
+    if (_DelayHasHistory == 0u || amount <= 1e-5)
+    {
+        statePosition = targetPosition;
+        stateRotation = targetRotation;
+        stateScale = targetScale;
+        positionVelocity = 0.0;
+        rotationVelocity = 0.0;
+        scaleVelocity = 0.0;
+    }
+    else
+    {
+        if (dot(stateRotation, targetRotation) < 0.0) targetRotation = -targetRotation;
+        float omega = lerp(36.0, 7.0, amount);
+        float dampingRatio = lerp(0.98, 0.16, amount);
+        float spring = omega * omega;
+        float damping = 2.0 * dampingRatio * omega;
+        float totalDelta = min(max(_DelayDeltaTime, 0.0), 1.0 / 30.0);
+        uint steps = totalDelta > 1.0 / 60.0 ? 2u : 1u;
+        float stepDelta = steps > 0u ? totalDelta / float(steps) : 0.0;
+        [unroll] for (uint step = 0u; step < 2u; step++)
+        {
+            if (step >= steps) break;
+            positionVelocity += ((targetPosition - statePosition) * spring - positionVelocity * damping) * stepDelta;
+            statePosition += positionVelocity * stepDelta;
+            rotationVelocity += ((targetRotation - stateRotation) * spring - rotationVelocity * damping) * stepDelta;
+            stateRotation += rotationVelocity * stepDelta;
+            float rotationLengthSq = dot(stateRotation, stateRotation);
+            stateRotation = rotationLengthSq > 1e-10
+                ? stateRotation * rsqrt(rotationLengthSq) : float4(0, 0, 0, 1);
+            rotationVelocity -= stateRotation * dot(stateRotation, rotationVelocity);
+            scaleVelocity += ((targetScale - stateScale) * spring - scaleVelocity * damping) * stepDelta;
+            stateScale += scaleVelocity * stepDelta;
+        }
+        stateScale = max(stateScale, 0.001);
+    }
+
+    _DelayPositionState[c] = float4(statePosition, 0.0);
+    _DelayRotationState[c] = stateRotation;
+    _DelayScaleState[c] = float4(stateScale, 0.0);
+    velocityState.position = float4(positionVelocity, 0.0);
+    velocityState.rotation = rotationVelocity;
+    velocityState.scale = float4(scaleVelocity, 0.0);
+    _DelayVelocity[c] = velocityState;
+    // Spring changes the temporal transform response only; it does not own an appearance channel.
+    _EffectorPosition[c] = float4(statePosition, targetPositionData.w);
+    _EffectorRotation[c] = stateRotation;
+    _EffectorScale[c] = float4(stateScale, 0.0);
+}
+
+float3 push_pair_direction(uint self, uint other)
+{
+    uint lo = min(self, other), hi = max(self, other);
+    uint h = hash_u32(lo * 0x9e3779b9u ^ hi * 0x85ebca6bu);
+    float3 direction = float3(float(h & 1023u), float((h >> 10) & 1023u), float((h >> 20) & 1023u));
+    direction = direction / 511.5 - 1.0;
+    if (dot(direction, direction) <= 1e-6) direction = float3(1, 0, 0);
+    direction = normalize(direction);
+    return self < other ? -direction : direction;
+}
+
+bool push_correction(float3 difference, float minimumDistance, int mode,
+                     uint self, uint other, out float3 correction)
+{
+    correction = float3(0, 0, 0);
+    bool hasCorrection = false;
+    if (mode == 0)
+    {
+        float distanceToOther = length(difference);
+        if (distanceToOther < minimumDistance)
+        {
+            float3 direction = distanceToOther > 1e-6
+                ? difference / distanceToOther
+                : push_pair_direction(self, other);
+            correction = direction * (minimumDistance - distanceToOther);
+            hasCorrection = true;
+        }
+    }
+    else
+    {
+        float component = mode == 1 ? difference.x : (mode == 2 ? difference.y : difference.z);
+        float perpendicularSq = max(0.0, dot(difference, difference) - component * component);
+        float requiredAxis = sqrt(max(0.0, minimumDistance * minimumDistance - perpendicularSq));
+        float overlap = requiredAxis - abs(component);
+        if (overlap > 0.0)
+        {
+            float signValue = abs(component) > 1e-6 ? sign(component) : (self < other ? -1.0 : 1.0);
+            float axisCorrection = overlap * signValue;
+            correction = mode == 1 ? float3(axisCorrection, 0, 0)
+                       : mode == 2 ? float3(0, axisCorrection, 0)
+                                   : float3(0, 0, axisCorrection);
+            hasCorrection = true;
+        }
+    }
+    return hasCorrection;
+}
+
+[numthreads(64, 1, 1)]
+void PushApartEffector(uint3 id : SV_DispatchThreadID)
+{
+    uint c = effector_thread_index(id);
+    if (c >= _EffectorClumpCount || _EffectorIndex >= _EffectorCount) return;
+
+    GpuFractureEffector e = _Effectors[_EffectorIndex];
+    float4 currentOffset = _EffectorPosition[c];
+    float3 selfPivot = effector_base_pivot(c) + currentOffset.xyz;
+    float selfWeight = effector_weight(e, selfPivot);
+    float minimumDistance = max(0.0, e.parameters.x) * 2.0;
+    float3 delta = float3(0, 0, 0);
+    if (abs(selfWeight) > 1e-6 && minimumDistance > 0.0)
+    {
+        uint neighborCount = min(_EffectorNeighborCounts[c], (uint)MAX_NB);
+        for (uint n = 0u; n < neighborCount; n++)
+        {
+            int otherId = _EffectorNeighbors[c * (uint)MAX_NB + n];
+            if (otherId < 0 || (uint)otherId >= _EffectorClumpCount) continue;
+            uint other = (uint)otherId;
+            float3 otherPivot = effector_base_pivot(other) + _EffectorPosition[other].xyz;
+            float3 correction = float3(0, 0, 0); // explicit for Metal's out-parameter definite-assignment analysis
+            if (!push_correction(selfPivot - otherPivot, minimumDistance, e.mode, c, other, correction)) continue;
+            bool otherMoves = abs(effector_weight(e, otherPivot)) > 1e-6;
+            delta += correction * (otherMoves ? 0.5 : 1.0) * selfWeight;
+        }
+        float deltaLength = length(delta);
+        if (deltaLength > minimumDistance) delta *= minimumDistance / deltaLength;
+    }
+    _EffectorPositionScratch[c] = float4(currentOffset.xyz + delta, max(currentOffset.w, abs(selfWeight)));
+}
+
+// ============================================================================================================
+//  DESTRUCTION FIELD + STRUCTURAL SUPPORT — progressive selection and event-driven connectivity.
+//  A break field (sphere/box/plane with falloff) sweeps the fracture; a fragment whose world centroid scores at
+//  or above the threshold is flagged for release this frame. The disintegrate sim's ReleaseClumps (mode 0) then
+//  reads these flags and lets the flagged fragments fly. Animate _BreakThreshold (1→0) or move the field to drive
+//  a progressive crumble. The buffers below are bound to the SAME GraphicsBuffers as the sim's state.
+// ============================================================================================================
+
+StructuredBuffer<float4>   _ClumpCentroid;   // per fragment: world-space anchored centroid
+StructuredBuffer<float>    _ClumpMass;       // per fragment: closed-mesh volume / average fragment volume
+RWStructuredBuffer<float4>  _ClumpPosStateF;  // per fragment: xyz pos, w state (0 anchored, 1 free)  [= sim's _ClumpPosState]
+RWStructuredBuffer<uint>    _ClumpHitF;       // per fragment: release flag                            [= sim's _ClumpHit]
+
+uint     _FieldShape;     // 0 sphere, 1 box, 2 plane
+float3   _FieldCenter;
+float    _FieldRadius;
+float    _FieldFalloff;   // 0..1 soft edge fraction
+float3   _FieldUp;        // plane normal (world)
+float4x4 _FieldInv;       // world → field-local (box; half-size = 1 in field space)
+float    _BreakThreshold; // release when field value >= this (= 1 - breakProgress)
+uint     _FieldClumpCount;
+
+// Normalized closeness: 1 at the field centre, 0 at the boundary, <0 outside. A fragment releases when this
+// (plus a per-fragment jitter) ≥ _BreakThreshold (= 1 - breakProgress), so progress 0 → nothing, 1 → whole field.
+float field_value(float3 p)
+{
+    float v;
+    if (_FieldShape == 1u)        // box (half-size = 1 in field-local space)
+    {
+        float3 lp = mul(_FieldInv, float4(p, 1.0)).xyz;
+        float3 q = abs(lp);
+        v = 1.0 - max(max(q.x, q.y), q.z);
+    }
+    else if (_FieldShape == 2u)   // plane: releases the negative-normal side first
+    {
+        v = -dot(p - _FieldCenter, normalize(_FieldUp)) / max(_FieldRadius, 1e-4);
+    }
+    else                          // sphere
+    {
+        v = 1.0 - distance(p, _FieldCenter) / max(_FieldRadius, 1e-4);
+    }
+    return v;
+}
+
+[numthreads(64, 1, 1)]
+void MarkFieldHits(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount) return;
+    if (_ClumpPosStateF[c].w >= 0.5) { _ClumpHitF[c] = 0u; return; }   // already free
+    float v = field_value(_ClumpCentroid[c].xyz);
+    float jit = _FieldFalloff * (((float)(hash_u32(c + 0x123u) & 0xffffu) / 65535.0) * 2.0 - 1.0) * 0.5;  // irregular front
+    _ClumpHitF[c] = (v + jit >= _BreakThreshold) ? 1u : 0u;
+}
+
+// ---- STRUCTURAL SUPPORT — event-driven rooted adjacency ----
+// The CPU bake graph is breadth-first rooted at the authored anchor boundary. An intact fragment remains attached
+// while it has an intact neighbour closer to a root. Optional same-level edges create deterministic lateral chains
+// for arches/bridges without introducing cycles that could leave a disconnected island floating forever.
+StructuredBuffer<int>  _NeighborsRO;
+StructuredBuffer<uint> _NeighborCountRO;
+StructuredBuffer<int>  _SupportLevelRO;
+float _SupportLateral;
+RWStructuredBuffer<uint> _CohesionState; // 0 granular/inactive, 1 newly released, 2 cohesive, 3 bond-broken
+StructuredBuffer<uint> _CohesionStateRead;
+uint _CohesionEnabled;
+float _CohesionDebrisFraction;
+RWStructuredBuffer<uint> _CohesionGroupRelease;
+StructuredBuffer<uint> _CohesionGroupReleaseRead;
+StructuredBuffer<uint> _CohesionGroup;
+StructuredBuffer<uint> _SupportHitRead;
+StructuredBuffer<float4> _SupportPosRead;
+uint _CohesionGroupCount;
+
+// _CascadeAccumulate = 0: legacy per-pass mode — marks are consumed (released) between passes, so only the current
+// graph layer is flagged. = 1: rigid-cluster mode — marks PERSIST and marked neighbours count as already gone, so
+// iterating the kernel graph-depth times inside one frame yields the COMPLETE set of cells with no remaining route
+// to the anchor (the detaching islands), without releasing anything in between.
+uint _CascadeAccumulate;
+
+[numthreads(64, 1, 1)]
+void MarkUnsupported(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount) return;
+    if (_ClumpPosStateF[c].w >= 0.5) { _ClumpHitF[c] = 0u; return; }
+    if (_CascadeAccumulate != 0u && _ClumpHitF[c] == 1u) return;   // already condemned this event
+
+    int supportLevel = _SupportLevelRO[c];
+    if (supportLevel <= 0) { _ClumpHitF[c] = 0u; return; } // intact boundary root
+
+    uint cnt = _NeighborCountRO[c];
+    bool supported = false;
+    for (uint neighborIndex = 0u; neighborIndex < cnt; neighborIndex++)
+    {
+        int neighbor = _NeighborsRO[c * (uint)MAX_NB + neighborIndex];
+        if (neighbor < 0) continue;
+        if (_ClumpPosStateF[neighbor].w >= 0.5) continue;
+        if (_CascadeAccumulate != 0u && _ClumpHitF[neighbor] == 1u) continue;   // condemned = gone
+
+        int neighborLevel = _SupportLevelRO[neighbor];
+        if (neighborLevel < supportLevel)
+        {
+            supported = true;
+            break;
+        }
+
+        // The index ordering makes same-level support acyclic. The stable edge hash lets Lateral Support smoothly
+        // control how many of those bridge connections participate without any CPU rebuild or runtime allocation.
+        if (neighborLevel == supportLevel && (uint)neighbor < c)
+        {
+            uint edgeHash = hash_u32(c * 0x9e3779b9u ^ (uint)neighbor * 0x85ebca6bu);
+            float edgeWeight = (float)(edgeHash & 0xffffu) / 65535.0;
+            if (edgeWeight <= saturate(_SupportLateral))
+            {
+                supported = true;
+                break;
+            }
+        }
+    }
+    _ClumpHitF[c] = supported ? 0u : 1u;
+}
+
+// RayFire-style connected-cluster activation: one unsupported member marks its continuous authored macro-group;
+// the expansion pass releases the group's remaining non-root cells together. Direct impact cells are already free
+// and therefore stay granular around the contact point, while level-zero roots remain unyielding.
+[numthreads(64, 1, 1)]
+void ClearClusterRelease(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _CohesionGroupCount) _CohesionGroupRelease[id.x] = 0u;
+}
+
+[numthreads(64, 1, 1)]
+void MarkClusterRelease(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount || _SupportHitRead[c] == 0u) return;
+    uint groupId = _CohesionGroup[c];
+    if (groupId < _CohesionGroupCount) InterlockedMax(_CohesionGroupRelease[groupId], 1u);
+}
+
+[numthreads(64, 1, 1)]
+void ExpandClusterRelease(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount || _SupportPosRead[c].w >= 0.5 || _SupportLevelRO[c] <= 0) return;
+    uint groupId = _CohesionGroup[c];
+    if (groupId >= _CohesionGroupCount || _CohesionGroupReleaseRead[groupId] == 0u) return;
+    _ClumpHitF[c] = 1u;
+    if (_CohesionEnabled != 0u && _CohesionState[c] == 0u)
+    {
+        float rubble = (float)(hash_u32(c * 0x27d4eb2du + 0x165667b1u) & 0xffffu) / 65535.0;
+        _CohesionState[c] = rubble < saturate(_CohesionDebrisFraction) ? 3u : 1u;
+    }
+}
+
+// ============================================================================================================
+// RIGID CLUSTERS — RayFire/Houdini-glue-style structural demolition.
+// When destruction disconnects part of the shell from the anchor, the ENTIRE connected island detaches as ONE
+// rigid body: one centre of mass, one orientation, one velocity/angular velocity. Member cells are kinematically
+// projected from the island transform every frame, so the section falls, topples, and lands as a monolith instead
+// of dissolving into sand. Member ground contacts and impact commands are aggregated into the island with
+// fixed-point atomics; when the worst single contact exceeds the material's Break Impulse the island deactivates
+// and its members continue as ordinary free cells with the rigid-field velocities they already carry.
+// Island identity = the smallest member cell index ("root"); island state lives in root-indexed slots.
+// ============================================================================================================
+
+#define ISLAND_NONE 0xffffffffu
+#define ISLAND_FP 1024.0
+#define ISLAND_ACC 24   // int accumulator slots per root (see layout notes at each stage)
+
+// UAV BUDGET RULE: every referenced RWStructuredBuffer counts against the 8-UAV kernel limit even when only
+// read. Kernels therefore read through the *Read SRV aliases below (bound to the SAME GraphicsBuffer) and only
+// declare RW access for what they actually write. Dispatches are sequential, so aliasing is hazard-free.
+RWStructuredBuffer<uint>   _IslandOf;          // per cell: root index of its rigid island (ISLAND_NONE = not clustered)
+RWStructuredBuffer<float4> _IslandPosState;    // root slot: xyz island COM (world), w 1 active / 0 inactive
+RWStructuredBuffer<float4> _IslandRot;         // root slot: island orientation (world quaternion)
+RWStructuredBuffer<float4> _IslandVel;         // root slot: xyz linear velocity, w sleep timer
+RWStructuredBuffer<float4> _IslandAngVel;      // root slot: xyz angular velocity (rad/s)
+RWStructuredBuffer<float4> _IslandData;        // root: x normalized volume mass, y 1/mass-weighted mean|r|², z count
+RWStructuredBuffer<float4> _IslandRestOffset;  // per cell: offset from island COM at creation (island rot = identity)
+RWStructuredBuffer<int>    _IslandAccum;       // root slot × ISLAND_ACC fixed-point accumulators
+
+StructuredBuffer<uint>   _IslandOfRead;
+StructuredBuffer<float4> _IslandStateRead;       // = _IslandPosState
+StructuredBuffer<float4> _IslandRotRead;
+StructuredBuffer<float4> _IslandVelRead;
+StructuredBuffer<float4> _IslandAngVelRead;
+StructuredBuffer<float4> _IslandDataRead;
+StructuredBuffer<float4> _IslandRestOffsetRead;
+StructuredBuffer<int>    _IslandAccumRead;
+StructuredBuffer<uint>   _IslandHitRead;         // = the support-hit marks buffer
+StructuredBuffer<float4> _IslandCellPosRead;     // = the per-cell pos/state buffer
+
+// Vertex/state buffers needed to free a member exactly like ReleaseClumps does (aliases of the sim buffers).
+StructuredBuffer<uint2>    _IslandClumpRange;
+StructuredBuffer<uint2>    _IslandShatteredIds;
+StructuredBuffer<float3>   _IslandDeformedPos;
+StructuredBuffer<float3>   _IslandDeformedNrm;
+RWStructuredBuffer<float3> _IslandFreeOffset;
+RWStructuredBuffer<float3> _IslandFreeNrm;
+RWStructuredBuffer<float4> _IslandClumpRot;
+RWStructuredBuffer<float4> _IslandClumpVel;
+RWStructuredBuffer<float4> _IslandClumpAngVel;
+RWStructuredBuffer<float4> _IslandClumpLife;
+RWStructuredBuffer<uint>   _IslandCohesionState;
+
+float4x4 _IslandL2W;
+float4x4 _IslandN2W;
+float3 _IslandBase;            // world reference point (bounds centre) keeping fixed-point sums small
+uint   _ClusterMinCells;       // islands below this size release granular instead
+float  _ClusterBreakImpulse;   // material impact-speed threshold; long/heavy landings receive modest stress scaling
+float  _IslandDt;
+float3 _IslandGravity;
+float  _IslandLinearDrag;
+float  _IslandSpinDamp;
+float  _IslandSleepLinear;
+float  _IslandSleepAngular;
+float  _IslandSleepDelay;
+float  _IslandContactStrength;
+float  _IslandAngularFactor;
+float  _IslandTopple;        // gravity-driven toppling about the contact support (mirrors _ToppleStrength)
+float  _IslandAngularDamp;   // angular damping while in contact (mirrors _ContactAngularDamping)
+float  _IslandToppleSeed;    // seconds of gravity-torque about the break hinge baked into a newborn island's spin
+float  _IslandSpinMin;       // micro-asymmetry tumble range (the authored Spin Speed knobs), inertia-attenuated
+float  _IslandSpinMax;
+float  _IslandAvgRadius;     // world-scaled average cell radius — the attenuation reference for the tumble
+uint   _IslandSpinSeed;
+
+// "Condemned this event": flagged unsupported by the accumulate cascade and still an intact (anchored) cell.
+bool island_marked_ro(uint c) { return _IslandHitRead[c] == 1u && _IslandCellPosRead[c].w < 0.5; }
+
+// ---- event stage: label connected components of the condemned set, min-index wins ----
+
+[numthreads(64, 1, 1)]
+void IslandLabelInit(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount) return;
+    if (island_marked_ro(c)) _IslandOf[c] = c;   // untouched otherwise — existing island memberships survive the event
+}
+
+[numthreads(64, 1, 1)]
+void IslandLabelProp(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount || !island_marked_ro(c)) return;
+    uint best = _IslandOf[c];
+    uint cnt = _NeighborCountRO[c];
+    for (uint k = 0u; k < cnt; k++)
+    {
+        int n = _NeighborsRO[c * (uint)MAX_NB + k];
+        if (n < 0 || !island_marked_ro((uint)n)) continue;
+        best = min(best, _IslandOf[(uint)n]);
+    }
+    _IslandOf[c] = best;   // races with neighbours only lower labels — the min converges monotonically
+}
+
+// Path compression: labels always point at marked cells, so one indirection hop per pass gives log-time convergence.
+[numthreads(64, 1, 1)]
+void IslandLabelCompress(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount || !island_marked_ro(c)) return;
+    uint label = _IslandOf[c];
+    uint parent = _IslandOf[label];
+    if (parent < label) _IslandOf[c] = parent;
+}
+
+// ---- event stage: per-island reduction (count, mass-weighted COM/inertia, attach hinge) via fixed-point atomics ----
+// Event accumulator layout: [0] member count, [4] Σmass·|r−COM|²·FP, [5..7] Σ(boundary centroid−base)·FP,
+// [8] boundary count, [9] Σmass·FP, [10..12] Σmass·(centroid−base)·FP. Boundary cells are condemned cells that
+// still touch a SURVIVING intact neighbour — together they approximate the hinge the section tears away from.
+
+[numthreads(64, 1, 1)]
+void IslandAccumClear(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount) return;
+    for (uint k = 0u; k < (uint)ISLAND_ACC; k++) _IslandAccum[c * (uint)ISLAND_ACC + k] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void IslandAccumCount(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount || !island_marked_ro(c)) return;
+    uint root = _IslandOfRead[c];
+    if (root >= _FieldClumpCount) return;
+    float3 p = _ClumpCentroid[c].xyz - _IslandBase;
+    float memberMass = max(_ClumpMass[c], 0.05);
+    int base = (int)(root * (uint)ISLAND_ACC);
+    InterlockedAdd(_IslandAccum[base + 0], 1);
+    InterlockedAdd(_IslandAccum[base + 9], (int)round(memberMass * ISLAND_FP));
+    InterlockedAdd(_IslandAccum[base + 10], (int)round(p.x * memberMass * ISLAND_FP));
+    InterlockedAdd(_IslandAccum[base + 11], (int)round(p.y * memberMass * ISLAND_FP));
+    InterlockedAdd(_IslandAccum[base + 12], (int)round(p.z * memberMass * ISLAND_FP));
+
+    // Break-hinge detection: a condemned cell that still touches a surviving intact cell sits on the tear line.
+    uint cnt = _NeighborCountRO[c];
+    for (uint k = 0u; k < cnt; k++)
+    {
+        int nb = _NeighborsRO[c * (uint)MAX_NB + k];
+        if (nb < 0) continue;
+        if (_IslandCellPosRead[(uint)nb].w >= 0.5) continue;     // free — no longer holds anything
+        if (_IslandHitRead[(uint)nb] == 1u) continue;            // condemned too — not surviving support
+        InterlockedAdd(_IslandAccum[base + 5], (int)round(p.x * ISLAND_FP));
+        InterlockedAdd(_IslandAccum[base + 6], (int)round(p.y * ISLAND_FP));
+        InterlockedAdd(_IslandAccum[base + 7], (int)round(p.z * ISLAND_FP));
+        InterlockedAdd(_IslandAccum[base + 8], 1);
+        break;   // count each boundary cell once
+    }
+}
+
+[numthreads(64, 1, 1)]
+void IslandAccumInertia(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount || !island_marked_ro(c)) return;
+    uint root = _IslandOfRead[c];
+    if (root >= _FieldClumpCount) return;
+    int base = (int)(root * (uint)ISLAND_ACC);
+    float totalMass = max((float)_IslandAccum[base + 9] / ISLAND_FP, 0.05);
+    float3 com = _IslandBase + float3(_IslandAccum[base + 10], _IslandAccum[base + 11], _IslandAccum[base + 12])
+                 / (ISLAND_FP * totalMass);
+    float3 r = _ClumpCentroid[c].xyz - com;
+    float memberMass = max(_ClumpMass[c], 0.05);
+    InterlockedAdd(_IslandAccum[base + 4], (int)round(min(dot(r, r) * memberMass, 1000.0) * ISLAND_FP));
+}
+
+// One thread per root: publish the island rigid state (or reject small islands) BEFORE members read it — a
+// separate dispatch so member reads can never race the root write.
+[numthreads(64, 1, 1)]
+void IslandFinalizeRoots(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount || !island_marked_ro(c) || _IslandOfRead[c] != c) return;
+    int base = (int)(c * (uint)ISLAND_ACC);
+    int count = _IslandAccum[base + 0];
+    if ((uint)count < max(_ClusterMinCells, 1u))
+    {
+        _IslandPosState[c] = float4(0.0, 0.0, 0.0, 0.0);   // rejected — members fall back to granular release
+        return;
+    }
+    float totalMass = max((float)_IslandAccum[base + 9] / ISLAND_FP, 0.05);
+    float3 com = _IslandBase + float3(_IslandAccum[base + 10], _IslandAccum[base + 11], _IslandAccum[base + 12])
+                 / (ISLAND_FP * totalMass);
+    float meanR2 = max((float)_IslandAccum[base + 4] / (ISLAND_FP * totalMass), 1e-3);
+
+    // A section tearing off is still hinged at its attachment boundary for an instant — gravity torques it about
+    // that hinge, so it leans away from the failure as it drops instead of falling dead-straight down the axis.
+    // ω0 = (g × (hinge − COM)) / mean|r|² integrated over Topple Seed seconds; symmetric cuts (hinge ≈ under the
+    // COM) produce ~zero hinge tip and rely on the micro-asymmetry tumble below.
+    float3 spin = float3(0.0, 0.0, 0.0);
+    float3 vel = float3(0.0, 0.0, 0.0);
+    int attachN = _IslandAccum[base + 8];
+    if (attachN > 0 && _IslandToppleSeed > 0.0)
+    {
+        float3 hinge = _IslandBase + float3(_IslandAccum[base + 5], _IslandAccum[base + 6], _IslandAccum[base + 7])
+                       / (ISLAND_FP * (float)attachN);
+        spin = cross(_IslandGravity, hinge - com) * (_IslandToppleSeed / meanR2);
+        // Swinging about the hinge means the COM already has the matching linear velocity when it lets go — the
+        // sideways kick off the stump. Without it the COM path is a perfectly vertical parabola however it spins.
+        vel = cross(spin, com - hinge);
+        float velLen = length(vel);
+        if (velLen > 3.0) vel *= 3.0 / velLen;
+    }
+
+    // Micro-asymmetry tumble: no real break is clean, so every island gets a deterministic residual spin sampled
+    // from the authored Spin Speed range and attenuated by size — ω from a fixed tearing torque scales with the
+    // inverse inertia, so a boulder barely turns where a brick whirls. This is what keeps symmetric and fully
+    // undermined (hinge-free) sections from dropping laser-straight down the axis.
+    uint spinState = hash_u32(c * 0x9e3779b9u ^ _IslandSpinSeed);
+    float attenuation = saturate(_IslandAvgRadius / max(sqrt(meanR2), 1e-3));
+    float tumble = lerp(min(_IslandSpinMin, _IslandSpinMax), max(_IslandSpinMin, _IslandSpinMax), pcg(spinState))
+                   * attenuation;
+    spin += rand_sphere(spinState) * tumble;
+    float spinLen = length(spin);
+    if (spinLen > 2.5) spin *= 2.5 / spinLen;   // cap the tip so violent gravity setups don't fling sections
+
+    _IslandPosState[c] = float4(com, 1.0);
+    _IslandRot[c] = float4(0.0, 0.0, 0.0, 1.0);
+    _IslandVel[c] = float4(vel, 0.0);
+    _IslandAngVel[c] = float4(spin, 0.0);
+    _IslandData[c] = float4(totalMass, 1.0 / meanR2, (float)count, 0.0);
+    // Reset the accumulators so this frame's contact stage starts clean for the newborn island.
+    for (uint k = 0u; k < (uint)ISLAND_ACC; k++) _IslandAccum[c * (uint)ISLAND_ACC + k] = 0;
+}
+
+// Member creation is split in two to stay under the 8-UAV limit.
+// PREPARE (runs while the cell is still anchored): capture vertex free-offsets/normals like ReleaseClumps, clear
+// the support-hit flag for accepted members (the legacy granular release that follows skips them), or drop the
+// island assignment for members of rejected (too small) islands so they stay flagged for that granular release.
+[numthreads(64, 1, 1)]
+void IslandCreateMembersPrepare(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount) return;
+    if (_ClumpHitF[c] != 1u || _IslandCellPosRead[c].w >= 0.5) return;   // marked + intact only
+    uint root = _IslandOf[c];
+    if (root >= _FieldClumpCount) return;
+    if (_IslandStateRead[root].w < 0.5)
+    {
+        _IslandOf[c] = ISLAND_NONE;   // island rejected — leave the hit flag for granular release
+        return;
+    }
+
+    float3 cen = _ClumpCentroid[c].xyz;
+    uint2 range = _IslandClumpRange[c];
+    for (uint k = 0u; k < range.y; k++)
+    {
+        uint si = range.x + k;
+        uint oi = _IslandShatteredIds[si].y;
+        float3 wp = mul(_IslandL2W, float4(_IslandDeformedPos[oi], 1.0)).xyz;
+        float3 wn = mul((float3x3)_IslandN2W, _IslandDeformedNrm[oi]);
+        float wl = length(wn);
+        _IslandFreeOffset[si] = wp - cen;
+        _IslandFreeNrm[si] = wl > 1e-5 ? wn / wl : float3(0.0, 1.0, 0.0);
+    }
+    _ClumpHitF[c] = 0u;
+}
+
+// ACTIVATE: free every accepted member as a rigid-island cell — anchored centroid becomes its body origin, rest
+// offset from the island COM, zero velocity/spin (the ISLAND carries the motion). Accepted members are exactly
+// the still-anchored cells holding a valid assignment to an active island.
+[numthreads(64, 1, 1)]
+void IslandCreateMembersActivate(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount) return;
+    uint root = _IslandOfRead[c];
+    if (root == ISLAND_NONE || root >= _FieldClumpCount) return;
+    if (_ClumpPosStateF[c].w >= 0.5) return;             // already free — an existing member from a prior event
+    if (_IslandStateRead[root].w < 0.5) return;
+
+    float3 cen = _ClumpCentroid[c].xyz;
+    _ClumpPosStateF[c] = float4(cen, 1.0);
+    _IslandClumpRot[c] = float4(0.0, 0.0, 0.0, 1.0);
+    _IslandClumpVel[c] = float4(0.0, 0.0, 0.0, 0.0);
+    _IslandClumpAngVel[c] = float4(0.0, 0.0, 0.0, 0.0);
+    _IslandClumpLife[c] = float4(1.0, 0.0, 0.0, 0.0);
+    _IslandCohesionState[c] = 0u;
+    _IslandRestOffset[c] = float4(cen - _IslandStateRead[root].xyz, 0.0);
+}
+
+// ============================================================================================================
+// COHESIVE COLLAPSE — temporary macro-chunk constraints for unsupported fragments.
+// One thread still owns one Voronoi body. Solve writes scratch deltas; Apply consumes them in a separate dispatch,
+// avoiding read/write races. Work is CPU-time-bounded to the material's active cohesion window.
+// ============================================================================================================
+
+StructuredBuffer<float4> _CohesionGroupCenter; // per cell: local macro centre + radius
+RWStructuredBuffer<float4> _CohesionVel;
+RWStructuredBuffer<float4> _CohesionAngVel;
+RWStructuredBuffer<float4> _CohesionRot;
+StructuredBuffer<float4> _CohesionPosRead;
+StructuredBuffer<float4> _CohesionVelRead;
+StructuredBuffer<float4> _CohesionAngVelRead;
+StructuredBuffer<float4> _CohesionRotRead;
+StructuredBuffer<float4> _CohesionLife;
+RWStructuredBuffer<float4> _CohesionPositionDelta;
+RWStructuredBuffer<float4> _CohesionVelocityDelta;
+RWStructuredBuffer<float4> _CohesionAngularDelta;
+RWStructuredBuffer<float4> _CohesionRotationTarget;
+StructuredBuffer<float4> _CohesionPositionDeltaRead;
+StructuredBuffer<float4> _CohesionVelocityDeltaRead;
+StructuredBuffer<float4> _CohesionAngularDeltaRead;
+StructuredBuffer<float4> _CohesionRotationTargetRead;
+float4x4 _CohesionL2W;
+float3 _CohesionGravity;
+float _CohesionTopple;
+float _CohesionReleaseSpinMin;
+float _CohesionReleaseSpinMax;
+uint _CohesionReleaseSeed;
+float _CohesionStrength;
+float _CohesionDamping;
+float _CohesionBreakStrain;
+float _CohesionDuration;
+float _CohesionDt;
+float _CohesionMaxCorrection;
+
+[numthreads(64, 1, 1)]
+void SeedCohesiveMotion(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount || _CohesionState[c] != 1u) return;
+    float4 ps = _ClumpPosStateF[c];
+    if (ps.w < 0.5) return;
+
+    uint groupId = _CohesionGroup[c];
+    float3 groupCenter = mul(_CohesionL2W, float4(_CohesionGroupCenter[c].xyz, 1.0)).xyz;
+    uint randomState = hash_u32((groupId * 0x9e3779b9u + 0x68bc21ebu) ^ _CohesionReleaseSeed);
+    float3 randomDirection = float3(
+        (float)(randomState & 1023u) / 511.5 - 1.0,
+        (float)((randomState >> 10u) & 1023u) / 511.5 - 1.0,
+        (float)((randomState >> 20u) & 1023u) / 511.5 - 1.0);
+    float3 gravityDirection = length(_CohesionGravity) > 1e-5
+        ? normalize(_CohesionGravity)
+        : float3(0.0, -1.0, 0.0);
+    float3 axis = cross(gravityDirection, randomDirection);
+    if (dot(axis, axis) <= 1e-6) axis = cross(gravityDirection, float3(1.0, 0.0, 0.0));
+    if (dot(axis, axis) <= 1e-6) axis = float3(0.0, 0.0, 1.0);
+    float randomLength = length(randomDirection);
+    float3 releaseAxis = randomLength > 1e-5 ? randomDirection / randomLength : normalize(axis);
+    uint spinState = hash_u32(randomState ^ 0x85ebca6bu);
+    float spinT = (float)(spinState & 0xffffu) / 65535.0;
+    float releaseSpin = lerp(
+        min(_CohesionReleaseSpinMin, _CohesionReleaseSpinMax),
+        max(_CohesionReleaseSpinMin, _CohesionReleaseSpinMax),
+        spinT);
+    float3 omega = normalize(axis) * max(0.0, _CohesionTopple) + releaseAxis * max(0.0, releaseSpin);
+    _CohesionVel[c] = float4(_CohesionVel[c].xyz + cross(omega, ps.xyz - groupCenter), 0.0);
+    _CohesionAngVel[c] = float4(omega, 0.0);
+    _CohesionState[c] = 2u;
+}
+
+[numthreads(64, 1, 1)]
+void SolveCohesion(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    float4 zero = float4(0.0, 0.0, 0.0, 0.0);
+    if (c >= _FieldClumpCount) return;
+    _CohesionPositionDelta[c] = zero;
+    _CohesionVelocityDelta[c] = zero;
+    _CohesionAngularDelta[c] = zero;
+    _CohesionRotationTarget[c] = float4(0.0, 0.0, 0.0, 1.0);
+    if (_CohesionStateRead[c] != 2u || _CohesionPosRead[c].w < 0.5) return;
+    if (_CohesionLife[c].w >= _CohesionDuration)
+    {
+        _CohesionPositionDelta[c].w = 1.0;
+        return;
+    }
+
+    uint groupId = _CohesionGroup[c];
+    float3 selfPosition = _CohesionPosRead[c].xyz;
+    float3 selfVelocity = _CohesionVelRead[c].xyz;
+    float3 selfAngular = _CohesionAngVelRead[c].xyz;
+    float4 selfRotation = _CohesionRotRead[c];
+    float3 positionCorrection = float3(0.0, 0.0, 0.0);
+    float3 velocityCorrection = float3(0.0, 0.0, 0.0);
+    float3 angularCorrection = float3(0.0, 0.0, 0.0);
+    float4 rotationSum = selfRotation;
+    _CohesionRotationTarget[c] = selfRotation;
+    uint bonded = 0u;
+    bool broken = false;
+
+    uint neighborCount = _NeighborCountRO[c];
+    for (uint cohesionNeighbor = 0u; cohesionNeighbor < neighborCount; cohesionNeighbor++)
+    {
+        int neighborValue = _NeighborsRO[c * (uint)MAX_NB + cohesionNeighbor];
+        if (neighborValue < 0) continue;
+        uint neighbor = (uint)neighborValue;
+        if (_CohesionGroup[neighbor] != groupId || _CohesionStateRead[neighbor] != 2u ||
+            _CohesionPosRead[neighbor].w < 0.5) continue;
+
+        float3 currentDifference = _CohesionPosRead[neighbor].xyz - selfPosition;
+        float currentDistance = length(currentDifference);
+        float restDistance = distance(_ClumpCentroid[neighbor].xyz, _ClumpCentroid[c].xyz);
+        if (restDistance <= 1e-5 || currentDistance <= 1e-5) continue;
+        float strain = abs(currentDistance - restDistance) / restDistance;
+        if (strain > _CohesionBreakStrain) { broken = true; continue; }
+
+        float3 direction = currentDifference / currentDistance;
+        positionCorrection += direction * ((currentDistance - restDistance) * 0.5);
+        velocityCorrection += _CohesionVelRead[neighbor].xyz - selfVelocity;
+        angularCorrection += _CohesionAngVelRead[neighbor].xyz - selfAngular;
+        float4 neighborRotation = _CohesionRotRead[neighbor];
+        if (dot(neighborRotation, selfRotation) < 0.0) neighborRotation = -neighborRotation;
+        rotationSum += neighborRotation;
+        bonded++;
+    }
+
+    if (broken)
+    {
+        _CohesionPositionDelta[c].w = 1.0;
+        return;
+    }
+    if (bonded == 0u)
+    {
+        // Structural layers may join this group over the next few frames. Do not turn the leading layer granular
+        // before its neighbours have had a chance to release; genuinely solitary cells detach after the grace.
+        float joinGrace = min(0.5, _CohesionDuration * 0.3);
+        if (_CohesionLife[c].w >= joinGrace) _CohesionPositionDelta[c].w = 1.0;
+        return;
+    }
+
+    float inverseBonded = 1.0 / (float)bonded;
+    _CohesionPositionDelta[c] = float4(positionCorrection * inverseBonded, 0.0);
+    _CohesionVelocityDelta[c] = float4(velocityCorrection * inverseBonded, 0.0);
+    _CohesionAngularDelta[c] = float4(angularCorrection * inverseBonded, 0.0);
+    _CohesionRotationTarget[c] = normalize(rotationSum);
+}
+
+[numthreads(64, 1, 1)]
+void ApplyCohesion(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount || _CohesionState[c] != 2u) return;
+    float4 positionDelta = _CohesionPositionDeltaRead[c];
+    if (positionDelta.w > 0.5) { _CohesionState[c] = 3u; return; }
+
+    float3 correction = positionDelta.xyz * saturate(_CohesionStrength);
+    float correctionLength = length(correction);
+    if (correctionLength > _CohesionMaxCorrection)
+        correction *= _CohesionMaxCorrection / correctionLength;
+
+    float4 ps = _ClumpPosStateF[c];
+    ps.xyz += correction;
+    _ClumpPosStateF[c] = ps;
+    float safeDt = max(_CohesionDt, 1e-4);
+    float3 velocity = _CohesionVel[c].xyz
+                    + correction * (0.12 / safeDt)
+                    + _CohesionVelocityDeltaRead[c].xyz * (saturate(_CohesionDamping) * 0.5);
+    float3 angularVelocity = _CohesionAngVel[c].xyz
+                           + _CohesionAngularDeltaRead[c].xyz * (saturate(_CohesionDamping) * 0.5);
+    _CohesionVel[c] = float4(velocity, 0.0);
+    _CohesionAngVel[c] = float4(angularVelocity, 0.0);
+    float rotationBlend = saturate(_CohesionStrength * 0.5);
+    _CohesionRot[c] = normalize(lerp(_CohesionRot[c], _CohesionRotationTargetRead[c], rotationBlend));
+}
+
+// ============================================================================================================
+//  SHAPE-AWARE COLLISION (point-sampled rigid contacts) — "thinking particles" style.
+//  Each fragment is still ONE rigid body, but its vertices act as collision sample points rigidly attached to
+//  that body. Per free fragment we test (a strided subset of) its vertices against the scene colliders; the
+//  contacts push the body out by the deepest penetration AND apply an angular response from each contact's
+//  offset to the centroid — so chunks rest on faces/edges and tumble instead of sinking as a centroid sphere.
+// ============================================================================================================
+
+struct GpuCollider
+{
+    float4 center;    // xyz centre, w = shape (0 plane, 1 sphere, 2 box)
+    float4 normal;    // xyz plane normal, w = sphere radius
+    float4 extent;    // xyz box half-extents (plane uses x,z as quad half-size)
+    float4 rot;       // orientation (world quaternion)
+    float4 response;  // x bounce, y friction, z strength, w _
+    float4 jitter;    // unused here
+};
+
+RWStructuredBuffer<float4> _CFPosState;   // = sim _ClumpPosState
+RWStructuredBuffer<float4> _CFRot;        // = sim _ClumpRot
+RWStructuredBuffer<float4> _CFVel;        // = sim _ClumpVel
+RWStructuredBuffer<float4> _CFAngVel;     // = sim _ClumpAngVel
+StructuredBuffer<uint2>    _CFRange;      // = _ClumpRange (vertex start, count)
+StructuredBuffer<float3>   _CFFreeOffset; // = _FreeOffset (vertex offset from centroid, set at release)
+StructuredBuffer<GpuCollider> _Colliders;
+uint  _ColliderCount;
+uint  _CFCount;
+uint  _CFMaxSamples;
+float _CFDt;
+float _CFStrength;       // how hard to resolve penetration per frame (0..1)
+float _AngularFactor;    // how much contact torque spins the body
+float _ContactTipResponse;
+float _ContactRestSlop;
+float _ContactAngularDamping;
+float _SleepLinearSpeed;
+float _SleepAngularSpeed;
+float3 _CFGravity;       // world-space net linear accel (gravity + wind) acting on the fragments
+float _ToppleStrength;   // gravity-driven toppling about the support (0 = off). Lets big chunks lie down.
+uint _IslandOnlyContacts; // 1 = shape-aware collision is authored OFF but rigid clusters still need ground contacts:
+                          // process ONLY island members so ordinary debris keeps its cheap sim-side collide look.
+
+float3 qrotc(float4 q, float3 v) { return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
+float4 qmulc(float4 a, float4 b)
+{
+    return float4(
+        a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz),
+        a.w * b.w - dot(a.xyz, b.xyz));
+}
+float3 safe_normc(float3 v, float3 fb) { float l = length(v); return l > 1e-5 ? v / l : fb; }
+
+// Point-vs-collider: returns float4(normal, penetrationDepth); depth <= 0 means no contact.
+float4 cf_plane(float3 p, GpuCollider c)
+{
+    float4 q = c.rot;
+    float3 d = p - c.center.xyz;
+    float3 n = safe_normc(c.normal.xyz, float3(0, 1, 0));
+    float sd = dot(d, n);
+    float lx = dot(d, qrotc(q, float3(1, 0, 0)));
+    float lz = dot(d, qrotc(q, float3(0, 0, 1)));
+    float depth = -1.0;
+    if (abs(lx) <= c.extent.x && abs(lz) <= c.extent.z && sd < 0.0) depth = -sd;
+    return float4(n, depth);
+}
+float4 cf_sphere(float3 p, GpuCollider c)
+{
+    float3 d = p - c.center.xyz;
+    float dist = length(d);
+    return float4(safe_normc(d, float3(0, 1, 0)), c.normal.w - dist);   // depth>0 when inside
+}
+float4 cf_box(float3 p, GpuCollider c)
+{
+    float4 q = c.rot;
+    float3 ld = qrotc(float4(-q.xyz, q.w), p - c.center.xyz);
+    float3 hs = max(c.extent.xyz, 1e-4);
+    float3 qd = abs(ld) - hs;
+    float4 r = float4(0, 1, 0, -1.0);
+    if (max(max(qd.x, qd.y), qd.z) < 0.0)   // inside → push to nearest face
+    {
+        float px = -qd.x, py = -qd.y, pz = -qd.z;
+        if (px <= py && px <= pz)  r = float4(qrotc(q, float3(sign(ld.x), 0, 0)), px);
+        else if (py <= pz)         r = float4(qrotc(q, float3(0, sign(ld.y), 0)), py);
+        else                       r = float4(qrotc(q, float3(0, 0, sign(ld.z))), pz);
+    }
+    return r;
+}
+
+[numthreads(64, 1, 1)]
+void CollideFragments(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _CFCount) return;
+    float4 ps = _CFPosState[c];
+    if (ps.w < 0.5) return;                 // only free fragments
+
+    // Rigid-cluster members don't respond themselves — their contacts aggregate into the island body, applied
+    // once per frame by IslandApplyContacts. Fixed-point atomics keep the reduction order-independent.
+    uint islandRoot = _IslandOfRead[c];
+    bool islandMember = islandRoot != ISLAND_NONE && islandRoot < _CFCount && _IslandStateRead[islandRoot].w >= 0.5;
+    if (_IslandOnlyContacts != 0u && !islandMember) return;
+    float3 islandCom = float3(0.0, 0.0, 0.0);
+    float islandInvMeanR2 = 0.0;
+    float islandMass = 1.0;
+    if (islandMember)
+    {
+        islandCom = _IslandStateRead[islandRoot].xyz;
+        islandInvMeanR2 = max(_IslandDataRead[islandRoot].y, 1e-4);
+        islandMass = max(_IslandDataRead[islandRoot].x, 1.0);
+    }
+    int islandBase = (int)(islandRoot * (uint)ISLAND_ACC);
+
+    uint2 range = _CFRange[c];
+    uint nC = min(_ColliderCount, 16u);
+    if (range.y == 0u || nC == 0u) return;
+
+    float3 cen = ps.xyz;
+    float4 q = _CFRot[c];
+    float3 vel = _CFVel[c].xyz;
+    float3 av  = _CFAngVel[c].xyz;
+    float  stillTime = _CFVel[c].w;   // sleep timer (read by SimClumps to freeze settled debris)
+
+    float3 velCorr = float3(0, 0, 0), avCorr = float3(0, 0, 0), rotCorr = float3(0, 0, 0);
+    float  maxDepth = 0.0, maxEffDepth = 0.0; float3 maxN = float3(0, 1, 0);
+    uint   contacts = 0u, touches = 0u;
+    float  restSlop = max(_ContactRestSlop, 0.0);
+    float3 contactOffSum = float3(0, 0, 0);   // mean offset of contacting points = the support, relative to centroid
+    float  sumOff2 = 0.0; uint sampleN = 0u;  // mean-squared sample radius ≈ rotational inertia / mass
+
+    uint count = range.y;
+    uint stride = max(count / max(_CFMaxSamples, 1u), 1u);
+    [loop] for (uint k = 0u; k < count; k += stride)
+    {
+        uint si = range.x + k;
+        float3 off = qrotc(q, _CFFreeOffset[si]);
+        float3 p = cen + off;
+        sumOff2 += dot(off, off); sampleN++;
+        [loop] for (uint ci = 0u; ci < nC; ci++)
+        {
+            GpuCollider col = _Colliders[ci];
+            uint shape = (uint)col.center.w;
+            float4 hit = (shape == 0u) ? cf_plane(p, col)
+                       : (shape == 1u) ? cf_sphere(p, col)
+                                       : cf_box(p, col);
+            if (hit.w <= 0.0) continue;
+            float3 n = hit.xyz; float depth = hit.w;
+            touches++;
+            contactOffSum += off;
+
+            float effDepth = max(depth - restSlop, 0.0);
+            float offN = dot(off, n);
+            float arm2 = max(dot(off, off) - offN * offN, 1e-4);
+            rotCorr += cross(off, n) * (effDepth / arm2);
+
+            float3 vpt = vel + cross(av, off);          // velocity at the contact point
+            float vn = dot(vpt, n);
+            if (vn < 0.0)
+            {
+                float bounce = saturate(col.response.x), friction = saturate(col.response.y);
+                float contactMass = islandMember ? islandMass : max(_ClumpMass[c], 0.05);
+                if (contactMass > 1.0)
+                {
+                    // Restitution is a material cue, but a large multi-cell body should not rebound like one chip.
+                    // Compact-body area/mass response scales as mass^(-1/3); keep a small floor for extreme islands.
+                    float massAero = max(rcp(pow(max(contactMass, 1e-4), 1.0 / 3.0)), 0.15);
+                    bounce *= sqrt(massAero);
+                }
+                if (-vn < max(_SleepLinearSpeed * 3.0, 0.5)) bounce = 0.0;
+                if (islandMember)
+                {
+                    // Effective mass couples the island's translation and rotation at this point. Applying the full
+                    // correction to BOTH (the old path) over-corrected long lever arms: a pillar tip would kick its
+                    // COM upward while also spinning away, then gravity pulled it back into the floor forever.
+                    float3 islandArm = p - islandCom;
+                    float3 normalArm = cross(islandArm, n);
+                    float normalShare = rcp(1.0 + dot(normalArm, normalArm) * islandInvMeanR2
+                                                  * max(_AngularFactor, 0.0));
+                    float3 impulse = n * (-vn * (1.0 + bounce) * normalShare);
+                    float3 tangent = vpt - n * vn;
+                    float tangentSpeed = length(tangent);
+                    if (friction > 1e-4 && tangentSpeed > 1e-5)
+                    {
+                        float3 tangentDir = tangent / tangentSpeed;
+                        float3 tangentArm = cross(islandArm, tangentDir);
+                        float tangentShare = rcp(1.0 + dot(tangentArm, tangentArm) * islandInvMeanR2
+                                                       * max(_AngularFactor, 0.0));
+                        impulse -= tangent * (friction * tangentShare);
+                    }
+                    float3 torque = cross(islandArm, impulse);
+                    InterlockedAdd(_IslandAccum[islandBase + 0], (int)round(impulse.x * ISLAND_FP));
+                    InterlockedAdd(_IslandAccum[islandBase + 1], (int)round(impulse.y * ISLAND_FP));
+                    InterlockedAdd(_IslandAccum[islandBase + 2], (int)round(impulse.z * ISLAND_FP));
+                    InterlockedAdd(_IslandAccum[islandBase + 3], 1);
+                    InterlockedAdd(_IslandAccum[islandBase + 4], (int)round(torque.x * ISLAND_FP));
+                    InterlockedAdd(_IslandAccum[islandBase + 5], (int)round(torque.y * ISLAND_FP));
+                    InterlockedAdd(_IslandAccum[islandBase + 6], (int)round(torque.z * ISLAND_FP));
+                    // Keep landing damage independent of the solver correction above. The inward point speed
+                    // includes the angular velocity at a falling pillar's tip, which is the stress that cracks it.
+                    InterlockedMax(_IslandAccum[islandBase + 15], (int)round((-vn) * ISLAND_FP));
+                }
+                else
+                {
+                    float3 jn = n * (-vn * (1.0 + bounce));  // cancel inward normal vel (+ bounce)
+                    velCorr += jn;
+                    avCorr  += cross(off, jn) * _AngularFactor;
+                    velCorr -= (vpt - n * vn) * friction;    // tangential friction
+                }
+                contacts++;
+            }
+            if (depth > maxDepth) { maxDepth = depth; maxN = n; }
+            if (effDepth > maxEffDepth) { maxEffDepth = effDepth; maxN = n; }
+        }
+    }
+
+    if (islandMember)
+    {
+        // Penetration push aggregates too; the member itself is kinematic (re-projected from the island next frame).
+        // The mean contact offset (island frame) feeds the gravity-topple term — the lever arm that lets a leaning
+        // monolith fall over instead of swinging on its contact like a pendulum.
+        if (maxEffDepth > 0.0)
+        {
+            float3 push = maxN * maxEffDepth;
+            InterlockedAdd(_IslandAccum[islandBase + 8], (int)round(push.x * ISLAND_FP));
+            InterlockedAdd(_IslandAccum[islandBase + 9], (int)round(push.y * ISLAND_FP));
+            InterlockedAdd(_IslandAccum[islandBase + 10], (int)round(push.z * ISLAND_FP));
+            InterlockedAdd(_IslandAccum[islandBase + 7], 1);
+            if (touches > 0u)
+            {
+                float3 memberOffBar = cen + contactOffSum / (float)touches - islandCom;
+                InterlockedAdd(_IslandAccum[islandBase + 12], (int)round(memberOffBar.x * ISLAND_FP));
+                InterlockedAdd(_IslandAccum[islandBase + 13], (int)round(memberOffBar.y * ISLAND_FP));
+                InterlockedAdd(_IslandAccum[islandBase + 14], (int)round(memberOffBar.z * ISLAND_FP));
+            }
+        }
+        return;
+    }
+
+    if (maxDepth > 0.0)
+    {
+        cen += maxN * maxEffDepth * saturate(_CFStrength);   // push meaningful penetration out, leaving a rest band
+        if (contacts > 0u)
+        {
+            float inv = 1.0 / (float)contacts;
+            vel += velCorr * inv;
+            av  += avCorr * inv;
+        }
+        if (touches > 0u)
+        {
+            float dt = max(_CFDt, 1e-4);
+            float3 step = rotCorr * (1.0 / (float)touches) * saturate(_CFStrength) * max(_ContactTipResponse, 0.0);
+            float lenStep = length(step);
+            if (maxEffDepth > 0.0 && lenStep > 1e-5)
+            {
+                float angle = min(lenStep, 0.35);          // cap contact correction to avoid one-frame popping
+                float3 axis = step / lenStep;
+                float halfAngle = angle * 0.5;
+                q = normalize(qmulc(float4(axis * sin(halfAngle), cos(halfAngle)), q));
+                av += axis * (angle / dt) * 0.08;          // small carry-through so toppling does not feel sticky
+            }
+
+            // Gravity toppling: gravity acts at the centroid while the chunk is held at its contacts, so an
+            // off-centre support produces a torque that rotates the body until the centroid sits over (then past)
+            // the support — the missing term that lets a leaning pole/slab fall flat instead of balancing on a
+            // landing corner forever. Inertia-scaled (÷ mean-squared radius) so the falling tip moves at a
+            // size-independent rate: big chunks no longer topple ~100× slower than small ones.
+            if (_ToppleStrength > 0.0)
+            {
+                float3 offBar = contactOffSum / (float)touches;
+                float inertia = max(sumOff2 / (float)max(sampleN, 1u), 1e-4);
+                av += (cross(_CFGravity, offBar) / inertia) * (_ToppleStrength * dt);
+            }
+
+            av *= saturate(1.0 - max(_ContactAngularDamping, 0.0) * dt);
+            float sleepL = max(_SleepLinearSpeed, 0.0);
+            float sleepA = max(_SleepAngularSpeed, 0.0);
+            if (sleepL > 0.0 && dot(vel, vel) < sleepL * sleepL) vel = float3(0, 0, 0);
+            if (sleepA > 0.0 && dot(av, av) < sleepA * sleepA) av = float3(0, 0, 0);
+
+            // Both below threshold while in contact → count toward sleep. The chunk only ever reaches this state
+            // once fully settled AND balanced (an unbalanced one keeps a toppling av above the angular threshold),
+            // so accumulating here is safe; once stillTime crosses _SleepDelay, SimClumps freezes it.
+            bool rested = (dot(vel, vel) == 0.0) && (dot(av, av) == 0.0);
+            stillTime = rested ? (stillTime + dt) : 0.0;
+        }
+        _CFPosState[c] = float4(cen, 1.0);
+        _CFRot[c] = q;
+        _CFVel[c] = float4(vel, stillTime);
+        _CFAngVel[c] = float4(av, 0.0);
+    }
+    else if (stillTime > 0.0)
+    {
+        _CFVel[c] = float4(vel, 0.0);   // lost all contact → clear the timer so SimClumps wakes it (gravity resumes)
+    }
+}
+
+// ============================================================================================================
+//  SETTLE — the release spin is an INITIAL THRUST only. For the first N frames (random per fragment in the
+//  thrust-frames range) the spin runs free; after that it is damped out so chunks stop spinning and settle,
+//  instead of tumbling forever. Optional linear drag too.
+// ============================================================================================================
+
+RWStructuredBuffer<float4> _SFAngVel;     // = sim _ClumpAngVel
+RWStructuredBuffer<float4> _SFVel;        // = sim _ClumpVel
+StructuredBuffer<float4>   _SFPosState;   // = sim _ClumpPosState
+StructuredBuffer<float4>   _SFLife;       // = sim _ClumpLife (w = age seconds)
+uint  _SFCount;
+float _SFDt;
+float _ThrustFramesMin, _ThrustFramesMax;
+float _SpinDamp;       // spin decay /sec AFTER the thrust window
+float _LinearDrag;     // linear decay /sec AFTER the thrust window
+
+[numthreads(64, 1, 1)]
+void SettleFragments(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _SFCount) return;
+    if (_SFPosState[c].w < 0.5) return;                 // only free fragments
+
+    float frames = _SFLife[c].w / max(_SFDt, 1e-5);
+    float h = (float)(hash_u32(c + 777u) & 0xffffu) / 65535.0;
+    float thrust = lerp(_ThrustFramesMin, _ThrustFramesMax, h);
+    if (frames < thrust) return;                        // still in the thrust window — let it spin
+
+    float3 av = _SFAngVel[c].xyz * saturate(1.0 - _SpinDamp * _SFDt);
+    _SFAngVel[c] = float4(av, 0.0);
+    if (_LinearDrag > 0.0)
+    {
+        float3 v = _SFVel[c].xyz * saturate(1.0 - _LinearDrag * _SFDt);
+        _SFVel[c] = float4(v, _SFVel[c].w);   // preserve the sleep timer in .w (set by the collide pass)
+    }
+}
+
+// ============================================================================================================
+// RIGID CLUSTERS — per-frame dynamics (declarations + event kernels live above the collide section).
+// ============================================================================================================
+
+// Frame accumulator layout per root: [0..2] Σ contact impulse·FP, [3] contact count, [4..6] Σ contact torque·FP,
+// [7] touch count, [8..10] Σ penetration push·FP, [11] max routed/self-collision velocity change·FP,
+// [12..14] Σ contact offset·FP, [15] max collider closing speed·FP, [16..18] Σ impact impulse·FP,
+// [19..21] Σ impact torque·FP, [22] impact count. Contacts apply as a MEAN (rest-solve semantics); impacts apply
+// divided by island MASS (momentum semantics) — one bullet must not fling a 1700-cell monolith at full bullet speed.
+// Clear this frame's contact accumulators and integrate the island rigid body. Islands feel gravity + linear
+// drag only (a falling monolith has no business responding to curl noise); member cells still age/dissolve
+// through the ordinary SimClumps pass.
+[numthreads(64, 1, 1)]
+void IslandFrameBegin(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount || _IslandOfRead[c] != c) return;
+    float4 st = _IslandPosState[c];
+    if (st.w < 0.5) return;
+
+    for (uint k = 0u; k < (uint)ISLAND_ACC; k++) _IslandAccum[c * (uint)ISLAND_ACC + k] = 0;
+
+    float4 vel4 = _IslandVel[c];
+    if (_IslandSleepDelay > 0.0 && vel4.w >= _IslandSleepDelay) return;   // asleep — frozen until a contact wakes it
+
+    // Gravity acceleration is mass-independent. Aerodynamic/author damping is not: projected area grows slower
+    // than volume, so large monoliths retain momentum instead of decelerating like single lightweight cells.
+    float mass = max(_IslandDataRead[c].x, 1.0);
+    float aeroResponse = max(rcp(pow(max(mass, 1e-4), 1.0 / 3.0)), 0.15);
+    float3 vel = vel4.xyz + _IslandGravity * _IslandDt;
+    vel *= saturate(1.0 - _IslandLinearDrag * aeroResponse * _IslandDt);
+    float3 av = _IslandAngVel[c].xyz * saturate(1.0 - _IslandSpinDamp * aeroResponse * _IslandDt);
+    st.xyz += vel * _IslandDt;
+
+    float4 q = _IslandRot[c];
+    float avLen = length(av);
+    if (avLen > 1e-5)
+    {
+        float halfAngle = avLen * _IslandDt * 0.5;
+        float4 dq = float4((av / avLen) * sin(halfAngle), cos(halfAngle));
+        q = normalize(qmulc(dq, q));
+    }
+
+    _IslandPosState[c] = st;
+    _IslandRot[c] = q;
+    _IslandVel[c] = float4(vel, vel4.w);
+    _IslandAngVel[c] = float4(av, 0.0);
+}
+
+// Apply the frame's aggregated member contacts (and routed impact commands) to the island body, then decide
+// break/sleep. Runs after the collide pass.
+[numthreads(64, 1, 1)]
+void IslandApplyContacts(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount || _IslandOfRead[c] != c) return;
+    float4 st = _IslandPosState[c];
+    if (st.w < 0.5) return;
+
+    int base = (int)(c * (uint)ISLAND_ACC);
+    int contactN = _IslandAccumRead[base + 3];
+    int touchN = _IslandAccumRead[base + 7];
+    int impactN = _IslandAccumRead[base + 22];
+    float4 vel4 = _IslandVel[c];
+    float3 vel = vel4.xyz;
+    float sleepT = vel4.w;
+    float3 av = _IslandAngVel[c].xyz;
+    float invMeanR2 = max(_IslandDataRead[c].y, 1e-4);
+    float mass = max(_IslandDataRead[c].x, 1.0);
+    float externalImpact = (float)_IslandAccumRead[base + 11] / ISLAND_FP;
+    float landingSpeed = (float)_IslandAccumRead[base + 15] / ISLAND_FP;
+
+    if (contactN > 0)
+    {
+        float inv = 1.0 / (ISLAND_FP * (float)contactN);
+        float3 impulse = float3(_IslandAccumRead[base + 0], _IslandAccumRead[base + 1], _IslandAccumRead[base + 2]) * inv;
+        float3 torque  = float3(_IslandAccumRead[base + 4], _IslandAccumRead[base + 5], _IslandAccumRead[base + 6]) * inv;
+        vel += impulse;
+        av += torque * invMeanR2 * _IslandAngularFactor;
+    }
+
+    if (impactN > 0)
+    {
+        // Momentum semantics: each hit member contributed its velocity change × unit mass; the island responds
+        // with Σ/islandMass — a bullet nudges a monolith and flings a small clump, as it should.
+        float invFpMass = 1.0 / (ISLAND_FP * mass);
+        vel += float3(_IslandAccumRead[base + 16], _IslandAccumRead[base + 17], _IslandAccumRead[base + 18]) * invFpMass;
+        av += float3(_IslandAccumRead[base + 19], _IslandAccumRead[base + 20], _IslandAccumRead[base + 21])
+              * (invFpMass * invMeanR2);
+        sleepT = 0.0;   // a real hit wakes a settled island
+    }
+
+    float3 push = float3(0.0, 0.0, 0.0);
+    if (touchN > 0)
+    {
+        push = float3(_IslandAccumRead[base + 8], _IslandAccumRead[base + 9], _IslandAccumRead[base + 10])
+               / (ISLAND_FP * (float)touchN);
+        st.xyz += push * saturate(_IslandContactStrength);
+    }
+
+    // A long/heavy rock develops more bending stress at the same landing speed than a compact handful of cells.
+    // The modest capped multiplier makes large pillars crack on a believable strike without making small clumps
+    // fragile. It reuses the island inertia + average authored cell radius: no new reduction, buffer, or dispatch.
+    float rmsRadius = rsqrt(invMeanR2);
+    float spanInCells = rmsRadius / max(_IslandAvgRadius, 1e-3);
+    float largeIsland = saturate((mass - 12.0) / 52.0);
+    float longIsland = saturate((spanInCells - 3.0) / 9.0);
+    float landingStress = landingSpeed * (1.0 + 0.5 * largeIsland * longIsland);
+    float breakSignal = max(externalImpact, landingStress);
+
+    // Break on a hard landing or a heavy routed/self impact. The island's mass deliberately does not shield a
+    // local material failure; the material preset / custom Break Impulse remains the art-direction control.
+    if ((contactN > 0 || impactN > 0) && _ClusterBreakImpulse > 0.0 && breakSignal > _ClusterBreakImpulse)
+    {
+        // Shatter: deactivate the island. IslandProject performs the final corrected rigid pose/velocity handoff
+        // before unbinding, so the authored cells continue naturally from the exact instant of impact.
+        _IslandPosState[c] = float4(st.xyz, 0.0);
+        _IslandVel[c] = float4(vel, 0.0);
+        _IslandAngVel[c] = float4(av, 0.0);
+        return;
+    }
+
+    // One resting rule: touching AND slow (after this frame's contact response) accumulates sleep; anything else
+    // resets it. The per-frame gravity-cancelling rest contact leaves vel ≈ 0, so a landed monolith settles; a
+    // bullet or landing impulse leaves vel large, so it wakes.
+    if (touchN > 0)
+    {
+        // Gravity toppling about the mean contact support — an off-centre support must make the island fall OVER,
+        // not oscillate. Without this term (and the damping below) a leaning monolith swings on its contact like a
+        // pendulum forever: each rock reverses the contact torque and nothing bleeds the energy.
+        if (_IslandTopple > 0.0)
+        {
+            float3 offBar = float3(_IslandAccumRead[base + 12], _IslandAccumRead[base + 13], _IslandAccumRead[base + 14])
+                            / (ISLAND_FP * (float)touchN);
+            // Quantized/sample-asymmetric contacts leave a tiny sideways lever even on a stable broad face. Remove
+            // that sub-cell noise floor so gravity topples a genuinely leaning pillar but does not rock a landed one.
+            float gravityLength = length(_IslandGravity);
+            float leverWeight = 1.0;
+            if (gravityLength > 1e-5)
+            {
+                float3 gravityDir = _IslandGravity / gravityLength;
+                float3 lateral = offBar - gravityDir * dot(offBar, gravityDir);
+                float lateralLength = length(lateral);
+                float leverFloor = max(_IslandAvgRadius * 0.04, 1e-3);
+                leverWeight = saturate((lateralLength - leverFloor) / max(lateralLength, leverFloor));
+            }
+            av += cross(_IslandGravity, offBar) * invMeanR2 * (_IslandTopple * _IslandDt * leverWeight);
+        }
+
+        // Preserve lively damping on the actual strike, then converge aggressively as contact speed approaches
+        // rest. Low-speed support is non-bouncy: discard only the tiny solver-created velocity away from gravity.
+        float quietContactSpeed = max(_IslandSleepLinear * 6.0, 0.75);
+        float activeContact = saturate((landingSpeed - quietContactSpeed) / quietContactSpeed);
+        float dampingScale = lerp(1.0, 0.3, activeContact);
+        av *= saturate(1.0 - max(_IslandAngularDamp, 0.0) * dampingScale * _IslandDt);
+        float gravityLength = length(_IslandGravity);
+        if (gravityLength > 1e-5 && landingSpeed < quietContactSpeed)
+        {
+            float3 supportUp = -_IslandGravity / gravityLength;
+            if (dot(push, supportUp) > 0.0)
+            {
+                float separatingSpeed = dot(vel, supportUp);
+                if (separatingSpeed > 0.0) vel -= supportUp * separatingSpeed;
+            }
+        }
+
+        bool slowLin = dot(vel, vel) < _IslandSleepLinear * _IslandSleepLinear;
+        bool slowAng = dot(av, av) < _IslandSleepAngular * _IslandSleepAngular;
+        if (slowLin && slowAng)
+        {
+            vel = float3(0.0, 0.0, 0.0);
+            av = float3(0.0, 0.0, 0.0);
+            sleepT += _IslandDt;
+        }
+        else sleepT = 0.0;
+    }
+    else sleepT = 0.0;   // airborne — never accumulate sleep
+
+    _IslandPosState[c] = st;
+    _IslandVel[c] = float4(vel, sleepT);
+    _IslandAngVel[c] = float4(av, 0.0);
+}
+
+// Kinematically place every member from its island transform. Runs LAST in the frame so it wins over whatever
+// SimClumps integrated for these cells (SimClumps stays untouched — its work on members is simply overwritten,
+// while its life/age handling still applies). Broken islands hand members back to the granular sim here.
+[numthreads(64, 1, 1)]
+void IslandProject(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount) return;
+    uint root = _IslandOf[c];
+    if (root == ISLAND_NONE || root >= _FieldClumpCount) return;
+
+    if (_IslandStateRead[root].w < 0.5)
+    {
+        // Island shattered: publish its FINAL corrected rigid pose and velocity before unbinding. Previously the
+        // member kept the prior frame, which discarded the landing response and could begin loose simulation still
+        // inside the floor. This path runs once per broken member, in the projection dispatch we already paid for.
+        float4 brokenQ = _IslandRotRead[root];
+        float3 brokenR = qrotc(brokenQ, _IslandRestOffsetRead[c].xyz);
+        float3 brokenAv = _IslandAngVelRead[root].xyz;
+        _ClumpPosStateF[c] = float4(_IslandStateRead[root].xyz + brokenR, 1.0);
+        _IslandClumpRot[c] = brokenQ;
+        _IslandClumpVel[c] = float4(_IslandVelRead[root].xyz + cross(brokenAv, brokenR), 0.0);
+        _IslandClumpAngVel[c] = float4(brokenAv, 0.0);
+        _IslandOf[c] = ISLAND_NONE;
+        _ClumpHitF[c] = 2u;
+        return;
+    }
+
+    float4 q = _IslandRotRead[root];
+    float3 r = qrotc(q, _IslandRestOffsetRead[c].xyz);
+    float3 av = _IslandAngVelRead[root].xyz;
+    _ClumpPosStateF[c] = float4(_IslandStateRead[root].xyz + r, 1.0);
+    _IslandClumpRot[c] = q;
+    _IslandClumpVel[c] = float4(_IslandVelRead[root].xyz + cross(av, r), 0.0);
+    _IslandClumpAngVel[c] = float4(av, 0.0);
+}
+
+// ============================================================================================================
+// SELF COLLISION — bounded sphere proxies in a uniform, linked-list spatial hash. The linked buckets cannot drop
+// bodies when a dense pile exceeds a fixed occupancy, and exact integer-cell checks reject hash collisions.
+// Every body is read from an immutable snapshot, making the response a true Jacobi pass rather than an in-kernel
+// position/velocity race. Anchored and sleeping bodies are static obstacles; a moving contact queues a wake for
+// the sleeping body or rigid island. Sphere pairs that overlap in the authored assembled pose are muted only until
+// they separate for the first time, after which re-entry collides normally. This avoids explosive false contacts
+// inside an intact fracture while preserving debris recollision. Island members aggregate response at their root.
+// ============================================================================================================
+
+static const uint SELF_NONE = 0xffffffffu;
+
+struct SelfBodySnapshot
+{
+    float4 positionRadius;  // xyz live centre; abs(w) proxy radius; w < 0 = anchored, w > 0 = free
+    float4 velocitySleep;   // xyz immutable velocity; w contact sleep timer (island timer for members)
+};
+
+RWStructuredBuffer<uint> _SelfContactStats; // unique contacts, responding bodies, muted rest responses, wake requests
+RWStructuredBuffer<uint> _SelfGridHead;     // hash bucket -> first body, SELF_NONE when empty
+RWStructuredBuffer<uint> _SelfGridNext;     // body -> next body in the same hash bucket
+StructuredBuffer<uint>   _SelfGridHeadRead;
+StructuredBuffer<uint>   _SelfGridNextRead;
+RWStructuredBuffer<SelfBodySnapshot> _SelfSnapshot;
+StructuredBuffer<SelfBodySnapshot>   _SelfSnapshotRead;
+StructuredBuffer<float>  _SelfCollisionRadius;
+StructuredBuffer<float4> _SelfLifeRead;
+RWStructuredBuffer<uint> _SelfWakeFlags;    // queued this frame, consumed by the body/root next frame
+StructuredBuffer<uint2>  _SelfRestRanges;   // per body: directional rest-entry start/count
+StructuredBuffer<uint2>  _SelfRestEntries;  // other body, undirected pair index; sorted by other body
+StructuredBuffer<uint2>  _SelfRestPairs;    // undirected endpoints, one thread per assembled-overlap pair
+RWStructuredBuffer<uint> _SelfPairActive;
+StructuredBuffer<uint>   _SelfPairActiveRead;
+uint  _SelfBucketMask;
+uint  _SelfBucketTotal;
+uint  _SelfRestPairCount;
+uint  _SelfCollectStats;
+float _SelfCellSize;
+float _SelfRadiusScale;
+float _SelfStrength;
+float _SelfRestSlop;
+float _SelfSleepDelay;
+float _SelfIslandAngularFactor;
+
+int3 self_coord(float3 p) { return (int3)floor(p / _SelfCellSize); }
+
+uint self_bucket_coord(int3 cc)
+{
+    return hash_u32((uint)cc.x * 73856093u ^ (uint)cc.y * 19349663u ^ (uint)cc.z * 83492791u) & _SelfBucketMask;
+}
+
+float3 self_pair_axis(uint body, uint other)
+{
+    uint lo = min(body, other), hi = max(body, other);
+    uint axisIndex = hash_u32(lo * 73856093u ^ hi * 19349663u) % 3u;
+    float3 axis = axisIndex == 0u ? float3(1.0, 0.0, 0.0)
+                : axisIndex == 1u ? float3(0.0, 1.0, 0.0)
+                                  : float3(0.0, 0.0, 1.0);
+    return body < other ? axis : -axis;
+}
+
+uint self_rest_pair(uint body, uint other)
+{
+    uint result = SELF_NONE;
+    uint2 range = _SelfRestRanges[body];
+    uint lo = range.x, hi = range.x + range.y;
+    while (lo < hi)
+    {
+        uint mid = lo + (hi - lo) / 2u;
+        uint2 entry = _SelfRestEntries[mid];
+        if (entry.x < other) lo = mid + 1u;
+        else hi = mid;
+    }
+    if (lo < range.x + range.y)
+    {
+        uint2 found = _SelfRestEntries[lo];
+        if (found.x == other) result = found.y;
+    }
+    return result;
+}
+
+[numthreads(64, 1, 1)]
+void SelfGridClear(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _SelfBucketTotal) _SelfGridHead[id.x] = SELF_NONE;
+    if (id.x == 0u && _SelfCollectStats != 0u)
+    {
+        _SelfContactStats[0] = 0u;
+        _SelfContactStats[1] = 0u;
+        _SelfContactStats[2] = 0u;
+        _SelfContactStats[3] = 0u;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void SelfGridInsert(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount) return;
+
+    float4 ps = _IslandCellPosRead[c];
+    bool freeBody = ps.w >= 0.5;
+    uint root = _IslandOfRead[c];
+    bool member = freeBody && root != ISLAND_NONE && root < _FieldClumpCount
+                  && _IslandStateRead[root].w >= 0.5;
+    uint wakeOwner = member ? root : c;
+    if (wakeOwner == c && _SelfWakeFlags[c] != 0u)
+    {
+        _SelfWakeFlags[c] = 0u;
+        if (member)
+        {
+            float4 islandVelocity = _IslandVel[c];
+            _IslandVel[c] = float4(islandVelocity.xyz, 0.0);
+        }
+        else
+        {
+            float4 bodyVelocity = _IslandClumpVel[c];
+            _IslandClumpVel[c] = float4(bodyVelocity.xyz, 0.0);
+        }
+    }
+
+    float lifeScale = freeBody ? max(_SelfLifeRead[c].x, 0.0) : 1.0;
+    float radius = _SelfCollisionRadius[c] * _SelfRadiusScale * lifeScale;
+    float3 position = freeBody ? ps.xyz : _ClumpCentroid[c].xyz;
+    float4 velocity = member
+        ? float4(_IslandClumpVel[c].xyz, _IslandVel[root].w)
+        : _IslandClumpVel[c];
+    SelfBodySnapshot snapshot;
+    snapshot.positionRadius = float4(position, freeBody ? radius : -radius);
+    snapshot.velocitySleep = velocity;
+    _SelfSnapshot[c] = snapshot;
+    if (radius <= 1e-6) return;
+
+    uint bucket = self_bucket_coord(self_coord(position));
+    uint previous;
+    InterlockedExchange(_SelfGridHead[bucket], c, previous);
+    _SelfGridNext[c] = previous;
+}
+
+// Rest-overlapping sphere proxies are collision-disabled while assembled. Arm a pair permanently after it has
+// separated once, so returning debris collides normally without the intact fracture exploding on release.
+[numthreads(64, 1, 1)]
+void SelfActivateRestPairs(uint3 id : SV_DispatchThreadID)
+{
+    uint pairIndex = id.x;
+    if (pairIndex >= _SelfRestPairCount || _SelfPairActive[pairIndex] != 0u) return;
+    uint2 pair = _SelfRestPairs[pairIndex];
+    SelfBodySnapshot a = _SelfSnapshotRead[pair.x];
+    SelfBodySnapshot b = _SelfSnapshotRead[pair.y];
+    bool eitherFree = a.positionRadius.w > 0.0 || b.positionRadius.w > 0.0;
+    if (!eitherFree) return;
+    float separation = distance(a.positionRadius.xyz, b.positionRadius.xyz);
+    float contactDistance = max(abs(a.positionRadius.w) + abs(b.positionRadius.w) - _SelfRestSlop, 0.0);
+    if (separation >= contactDistance) _SelfPairActive[pairIndex] = 1u;
+}
+
+[numthreads(64, 1, 1)]
+void SelfCollide(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _FieldClumpCount) return;
+    SelfBodySnapshot selfBody = _SelfSnapshotRead[c];
+    bool selfFree = selfBody.positionRadius.w > 0.0;
+    float selfRadius = abs(selfBody.positionRadius.w);
+    if (!selfFree || selfRadius <= 1e-6) return;                         // anchored cells are obstacles only
+
+    uint selfRoot = _IslandOfRead[c];
+    bool selfMember = selfRoot != ISLAND_NONE && selfRoot < _FieldClumpCount
+                      && _IslandStateRead[selfRoot].w >= 0.5;
+    bool selfSleeping = _SelfSleepDelay > 0.0 && selfBody.velocitySleep.w >= _SelfSleepDelay;
+    if (selfSleeping) return;                                           // active contacts treat us as static and wake us
+
+    float3 pos = selfBody.positionRadius.xyz;
+    float3 vel = selfBody.velocitySleep.xyz;
+    float3 islandCom = selfMember ? _IslandStateRead[selfRoot].xyz : float3(0.0, 0.0, 0.0);
+    float selfMass = selfMember ? max(_IslandDataRead[selfRoot].x, 0.05) : max(_ClumpMass[c], 0.05);
+    int islandBase = selfMember ? (int)(selfRoot * (uint)ISLAND_ACC) : 0;
+    float3 pushSum = float3(0.0, 0.0, 0.0);
+    float3 impulseSum = float3(0.0, 0.0, 0.0);
+    float3 torqueSum = float3(0.0, 0.0, 0.0);
+    uint contacts = 0u, uniqueContacts = 0u, suppressed = 0u, wakeRequests = 0u;
+    int3 centerCoord = self_coord(pos);
+
+    [loop] for (int ox = -1; ox <= 1; ox++)
+    [loop] for (int oy = -1; oy <= 1; oy++)
+    [loop] for (int oz = -1; oz <= 1; oz++)
+    {
+        int3 targetCoord = centerCoord + int3(ox, oy, oz);
+        uint other = _SelfGridHeadRead[self_bucket_coord(targetCoord)];
+        uint guard = 0u;
+        while (other != SELF_NONE && guard++ < _FieldClumpCount)
+        {
+            uint next = other < _FieldClumpCount ? _SelfGridNextRead[other] : SELF_NONE;
+            if (other == c || other >= _FieldClumpCount) { other = next; continue; }
+            SelfBodySnapshot otherBody = _SelfSnapshotRead[other];
+            if (any(self_coord(otherBody.positionRadius.xyz) != targetCoord)) { other = next; continue; }
+            if (selfMember && _IslandOfRead[other] == selfRoot) { other = next; continue; } // same rigid body
+
+            float otherRadius = abs(otherBody.positionRadius.w);
+            if (otherRadius <= 1e-6) { other = next; continue; }
+            float3 diff = pos - otherBody.positionRadius.xyz;
+            float dist = length(diff);
+            float overlap = selfRadius + otherRadius - dist - _SelfRestSlop;
+            if (overlap <= 0.0) { other = next; continue; }
+
+            uint restPair = self_rest_pair(c, other);
+            if (restPair != SELF_NONE && _SelfPairActiveRead[restPair] == 0u)
+            {
+                if (_SelfCollectStats != 0u) suppressed++;
+                other = next;
+                continue;
+            }
+
+            bool otherFree = otherBody.positionRadius.w > 0.0;
+            uint otherRoot = _IslandOfRead[other];
+            bool otherMember = otherFree && otherRoot != ISLAND_NONE && otherRoot < _FieldClumpCount
+                               && _IslandStateRead[otherRoot].w >= 0.5;
+            bool otherSleeping = otherFree && _SelfSleepDelay > 0.0
+                                 && otherBody.velocitySleep.w >= _SelfSleepDelay;
+            bool otherStatic = !otherFree || otherSleeping;
+            float otherMass = otherMember ? max(_IslandDataRead[otherRoot].x, 0.05) : max(_ClumpMass[other], 0.05);
+            // Jacobi resolves both directed sides. Weight each response by the OTHER body's share of total mass:
+            // a loose chip moves almost completely while a 500-cell pillar barely notices that same encounter.
+            float share = otherStatic ? 1.0 : otherMass / max(selfMass + otherMass, 0.1);
+            float3 n = dist > 1e-5 ? diff / dist : self_pair_axis(c, other);
+            pushSum += n * (overlap * share);
+            float3 otherVelocity = otherStatic ? float3(0.0, 0.0, 0.0) : otherBody.velocitySleep.xyz;
+            float vn = dot(vel - otherVelocity, n);
+            if (vn < 0.0)
+            {
+                float effectiveShare = share;
+                if (selfMember)
+                {
+                    // Match the shape-collider rigid solve: an off-centre response is shared between COM motion and
+                    // rotation. Without this denominator an intact wall/ground proxy gave a pillar the full linear
+                    // correction AND full torque, reintroducing the same balloon-like energy through self collision.
+                    float3 contactArm = pos - n * selfRadius - islandCom;
+                    float3 normalArm = cross(contactArm, n);
+                    float invMeanR2 = max(_IslandDataRead[selfRoot].y, 1e-4);
+                    effectiveShare *= rcp(1.0 + dot(normalArm, normalArm) * invMeanR2
+                                               * max(_SelfIslandAngularFactor, 0.0));
+                }
+                float3 impulse = n * (-vn * effectiveShare);
+                impulseSum += impulse;
+                if (selfMember) torqueSum += cross(pos - n * selfRadius - islandCom, impulse);
+            }
+            if (otherSleeping)
+            {
+                uint wakeOwner = otherMember ? otherRoot : other;
+                uint previousWake;
+                InterlockedOr(_SelfWakeFlags[wakeOwner], 1u, previousWake);
+                if (_SelfCollectStats != 0u && previousWake == 0u) wakeRequests++;
+            }
+            if (_SelfCollectStats != 0u && (!otherFree || otherSleeping || c < other)) uniqueContacts++;
+            contacts++;
+            other = next;
+        }
+    }
+
+    if (_SelfCollectStats != 0u && suppressed > 0u) InterlockedAdd(_SelfContactStats[2], suppressed);
+    if (_SelfCollectStats != 0u && wakeRequests > 0u) InterlockedAdd(_SelfContactStats[3], wakeRequests);
+    if (contacts == 0u) return;
+    if (_SelfCollectStats != 0u)
+    {
+        if (uniqueContacts > 0u) InterlockedAdd(_SelfContactStats[0], uniqueContacts);
+        InterlockedAdd(_SelfContactStats[1], 1u);
+    }
+    float inv = 1.0 / (float)contacts;
+    float3 push = pushSum * (inv * saturate(_SelfStrength));
+    float3 impulse = impulseSum * (inv * saturate(_SelfStrength));
+
+    if (selfMember)
+    {
+        InterlockedAdd(_IslandAccum[islandBase + 0], (int)round(impulse.x * ISLAND_FP));
+        InterlockedAdd(_IslandAccum[islandBase + 1], (int)round(impulse.y * ISLAND_FP));
+        InterlockedAdd(_IslandAccum[islandBase + 2], (int)round(impulse.z * ISLAND_FP));
+        InterlockedAdd(_IslandAccum[islandBase + 3], 1);
+        float3 torque = torqueSum * (inv * saturate(_SelfStrength));
+        InterlockedAdd(_IslandAccum[islandBase + 4], (int)round(torque.x * ISLAND_FP));
+        InterlockedAdd(_IslandAccum[islandBase + 5], (int)round(torque.y * ISLAND_FP));
+        InterlockedAdd(_IslandAccum[islandBase + 6], (int)round(torque.z * ISLAND_FP));
+        InterlockedAdd(_IslandAccum[islandBase + 8], (int)round(push.x * ISLAND_FP));
+        InterlockedAdd(_IslandAccum[islandBase + 9], (int)round(push.y * ISLAND_FP));
+        InterlockedAdd(_IslandAccum[islandBase + 10], (int)round(push.z * ISLAND_FP));
+        InterlockedAdd(_IslandAccum[islandBase + 7], 1);
+        InterlockedMax(_IslandAccum[islandBase + 11], (int)round(length(impulse) * ISLAND_FP));
+        return;
+    }
+
+    _ClumpPosStateF[c] = float4(pos + push, 1.0);
+    _IslandClumpVel[c] = float4(vel + impulse, selfBody.velocitySleep.w);
+}

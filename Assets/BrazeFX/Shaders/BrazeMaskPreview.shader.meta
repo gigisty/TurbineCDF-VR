@@ -1,0 +1,16 @@
+fileFormatVersion: 2
+guid: 56115ed94334542ed9391cd735d4c12e
+ShaderImporter:
+  externalObjects: {}
+  defaultTextures: []
+  nonModifiableTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Shaders/BrazeMaskPreview.shader
+  uploadId: 959622

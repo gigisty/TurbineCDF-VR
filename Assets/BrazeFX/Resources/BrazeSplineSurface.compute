@@ -1,0 +1,117 @@
+// BrazeFX — GPU spline-to-surface projection. Two kernels:
+//
+//   SpinCast — the WRAP/seed pass. One thread per sample. Each thread is one "camera shot": a ray fired from
+//     outside the mesh (at a scheduled angle + height around the chosen axis) straight inward toward the axis.
+//     Where it first hits the mesh, we drop a point (lifted along the surface normal). Brute-force ray-vs-all-
+//     triangles — dead simple, embarrassingly parallel, and an occasional (authoring-time) op so the O(rays ×
+//     tris) cost is a non-issue. This is the axis-based spinning raycaster: climb + spin = a helix on the shell.
+//
+//   ProjectPoints — the per-frame skinned TRACK pass. One thread per spline point; each queries the shared
+//     hashed triangle grid (BrazeMeshGrid) for the nearest point on the live deforming surface and re-snaps to
+//     it, so an already-placed wrap follows skinned animation cheaply. Small query range (points are already on
+//     the surface). See BrazeSplineSurface.cs.
+
+#pragma kernel ProjectPoints
+#pragma kernel SpinCast
+
+#include "BrazeMeshGrid.hlsl"
+
+// ── shared point I/O ────────────────────────────────────────────────────────────────
+StructuredBuffer<float3>   _InPoints;    // SpinCast: ray origins (world). ProjectPoints: current control points.
+RWStructuredBuffer<float4> _OutPoints;   // xyz = surface point + normal*offset; w = 1 on hit, 0 on miss (passthrough)
+
+// ── ProjectPoints (grid track pass) ───────────────────────────────────────────────────
+uint  _PointCount;
+float _Range;          // grid query reach (world units) — small for the track pass
+float _SurfaceOffset;  // lift along the surface normal
+
+[numthreads(64, 1, 1)]
+void ProjectPoints(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _PointCount) return;
+
+    float3 p = _InPoints[i];
+    int tri = -1; float3 bary = float3(1.0, 0.0, 0.0), sp = p, sn = float3(0.0, 1.0, 0.0);
+    if (braze_grid_query(p, _Range, tri, bary, sp, sn))
+        _OutPoints[i] = float4(sp + sn * _SurfaceOffset, 1.0);
+    else
+        _OutPoints[i] = float4(p, 0.0);   // out of reach this frame → keep the point where it is
+}
+
+// ── SpinCast (brute-force radial ray wrap) ────────────────────────────────────────────
+StructuredBuffer<float3> _CastPos;     // deformed world-space vertex positions
+StructuredBuffer<float3> _CastNrm;     // deformed world-space vertex normals
+StructuredBuffer<uint>   _CastIdx;     // triangle indices (3 per tri)
+StructuredBuffer<float3> _InDirs;      // per-sample inward ray direction (unit)
+uint  _CastTriCount;
+uint  _CastCount;
+float _CastMaxDist;    // clamp so the ray stops just past the axis — never punches through to the far shell
+float _CastOffset;     // lift along the surface normal
+
+// Möller–Trumbore, returns hit distance t and barycentric (u,v) of the b/c corners.
+bool braze_ray_tri(float3 o, float3 d, float3 a, float3 b, float3 c, out float t, out float u, out float v)
+{
+    const float eps = 1e-8;
+    t = 0.0; u = 0.0; v = 0.0;
+    bool hit = false;
+    float3 e1 = b - a, e2 = c - a;
+    float3 p = cross(d, e2);
+    float det = dot(e1, p);
+    if (abs(det) >= eps)
+    {
+        float inv = 1.0 / det;
+        float3 s = o - a;
+        u = dot(s, p) * inv;
+        if (u >= -eps && u <= 1.0 + eps)
+        {
+            float3 q = cross(s, e1);
+            v = dot(d, q) * inv;
+            if (v >= -eps && u + v <= 1.0 + eps)
+            {
+                t = dot(e2, q) * inv;
+                hit = t > eps;
+            }
+        }
+    }
+    return hit;
+}
+
+[numthreads(64, 1, 1)]
+void SpinCast(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _CastCount) return;
+
+    float3 o = _InPoints[i];
+    float3 d = _InDirs[i];
+
+    float bestT = _CastMaxDist;   // keep the FIRST hit from the outside = the outer shell
+    int best = -1;
+    float bu = 0.0, bv = 0.0;
+
+    for (uint tri = 0; tri < _CastTriCount; tri++)
+    {
+        uint i0 = _CastIdx[tri * 3 + 0];
+        uint i1 = _CastIdx[tri * 3 + 1];
+        uint i2 = _CastIdx[tri * 3 + 2];
+        float3 a = _CastPos[i0], b = _CastPos[i1], c = _CastPos[i2];
+        float t = 0.0, u = 0.0, v = 0.0;
+        if (braze_ray_tri(o, d, a, b, c, t, u, v) && t < bestT)
+        {
+            bestT = t; best = (int)tri; bu = u; bv = v;
+        }
+    }
+
+    if (best < 0) { _OutPoints[i] = float4(o, 0.0); return; }   // nothing there this shot → miss
+
+    uint j0 = _CastIdx[best * 3 + 0];
+    uint j1 = _CastIdx[best * 3 + 1];
+    uint j2 = _CastIdx[best * 3 + 2];
+    float3 hit = o + d * bestT;
+    float3 n = (1.0 - bu - bv) * _CastNrm[j0] + bu * _CastNrm[j1] + bv * _CastNrm[j2];
+    float nl = length(n);
+    n = nl > 1e-8 ? n / nl : normalize(cross(_CastPos[j1] - _CastPos[j0], _CastPos[j2] - _CastPos[j0]));
+    if (dot(n, d) > 0.0) n = -n;   // face outward (against the ray)
+    _OutPoints[i] = float4(hit + n * _CastOffset, 1.0);
+}

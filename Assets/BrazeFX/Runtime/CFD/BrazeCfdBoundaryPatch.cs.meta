@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 644b4a4906be47b89dad47493f9e9312
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {fileID: 2800000, guid: 9c958bcfd1f9049b4be9ce7816c20930, type: 3}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/CFD/BrazeCfdBoundaryPatch.cs
+  uploadId: 959622

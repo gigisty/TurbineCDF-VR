@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 938df7c7e84574b53aceca3c60c01b86
+DefaultImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Destruction/Demo 7 - Voronoi Fracture Destruction Pillars.unity
+  uploadId: 959622

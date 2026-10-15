@@ -1,0 +1,659 @@
+// BrazeFX — Volume field stack. A standalone procedural volume is built by a BrazeVolume "generator" (a base
+// primitive shape, NO noise) shaped by independent scene FIELDS (transform-driven falloff regions, like lights/force
+// fields). Each field is one bake-time pass: it reads _Src and writes _Dst (the host ping-pongs two 3D textures),
+// applying its operation gated by a falloff weight derived from the field's transform vs the volume box.
+//
+// Evaluation is in NORMALIZED box space: c = uvw*2-1 ∈ [-1,1]^3. _RegionInv maps c into a field's local UNIT shape.
+#pragma kernel GenerateBase
+#pragma kernel FilterNoise
+#pragma kernel FilterDensity
+#pragma kernel FilterRemap
+#pragma kernel FilterDeform
+#pragma kernel FilterSmooth
+#pragma kernel FilterSplineDensity
+#pragma kernel BuildOccupancy
+#pragma kernel LightBake
+#pragma kernel PackGeneratedLighting
+#pragma kernel GenTileNoise
+#include "../../../Resources/BrazeNoise.hlsl"
+
+RWTexture3D<float> _Dst;
+Texture3D<float>   _Src;
+SamplerState        sampler_Src;
+int3   _Res;
+float3 _WorldSize;
+
+float3 Uvw(uint3 id)   { return (float3(id) + 0.5) / float3(_Res); }
+float  SampleSrc(float3 uvw) { return _Src.SampleLevel(sampler_Src, saturate(uvw), 0); }
+
+float sdBox(float3 p, float3 b)   { float3 q = abs(p) - b; return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0); }
+float sdSphere(float3 p, float3 r){ float k0 = length(p / r); float k1 = length(p / (r * r)); return k0 * (k0 - 1.0) / max(k1, 1e-5); }
+float sdTorus(float3 p, float major, float minor) { float2 q = float2(length(p.xz) - major, p.y); return length(q) - minor; }
+float sdCapsule(float3 p, float halfLen, float r)  { p.y -= clamp(p.y, -halfLen, halfLen); return length(p) - r; }
+float sdCylinder(float3 p, float r, float h)       { float2 d = float2(length(p.xz) - r, abs(p.y) - h); return min(max(d.x, d.y), 0.0) + length(max(d, 0.0)); }
+float sdCone(float3 p, float r, float h)
+{
+    float t = saturate((p.y + h) / max(2.0 * h, 1e-5));
+    float rr = lerp(r, 0.0, t);
+    float2 d = float2(length(p.xz) - rr, abs(p.y) - h);
+    return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+}
+
+// ── Base generator ───────────────────────────────────────────────────────────────────────────────────────
+int    _ShapeType;     // 0 Box, 1 Sphere, 2 Cylinder, 3 Cone, 4 Torus, 5 Capsule, 6 Slab
+float3 _ShapeSize;
+float  _ShapeRound;
+float  _ShapeThick;
+float  _Falloff;
+float  _BaseDensity;
+
+float BaseShapeSdf(float3 c)
+{
+    float3 s = max(_ShapeSize, 1e-3);
+    float round = max(_ShapeRound, 0.0);
+    float result = sdBox(c, max(s - round, 1e-3)) - round;
+    if (_ShapeType == 1)      result = sdSphere(c, s) - round;
+    else if (_ShapeType == 2) result = sdCylinder(c, max(s.x, s.z), s.y) - round;
+    else if (_ShapeType == 3) result = sdCone(c, max(s.x, s.z), s.y) - round;
+    else if (_ShapeType == 4) result = sdTorus(c, max(max(s.x, s.z) - _ShapeThick, 0.02), max(_ShapeThick, 0.02)) - round;
+    else if (_ShapeType == 5) result = sdCapsule(c, max(s.y - s.x, 0.0), max(s.x, 0.02)) - round;
+    else if (_ShapeType == 6) result = sdBox(c, float3(s.x, min(s.y, _ShapeThick), s.z)) - round;
+    return result;
+}
+
+[numthreads(8, 8, 8)]
+void GenerateBase(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Res)) return;
+    float3 c = Uvw(id) * 2.0 - 1.0;
+    float d = BaseShapeSdf(c);
+    float density = (1.0 - smoothstep(-_Falloff, _Falloff, d)) * _BaseDensity;
+    _Dst[id] = max(density, 0.0);
+}
+
+// ── Shared falloff field (every filter is gated by this) ───────────────────────────────────────────────────
+int      _RegionType;    // 0 Sphere, 1 Box, 2 Capsule, 3 Cylinder, 4 Infinite
+float4x4 _RegionInv;     // box-normalized point (-1..1) → field-local unit space (the falloff region)
+float    _RegionSoft;    // soft falloff band (field-local units)
+int      _RegionInvert;  // affect OUTSIDE the field instead of inside
+float4x4 _DeformToLocal; // box-normalized → deform frame (field rotation/pivot, volume-normalized scale)
+float4x4 _DeformToBox;   // deform frame → box-normalized (inverse)
+float4x4 _BoxToWorld;    // box-normalized (-1..1) → world (for world-space distance, e.g. spline tubes)
+
+// ── Spline tube (shared by the Spline falloff REGION below AND the Spline density OP further down) ───────────
+StructuredBuffer<float4> _SplinePoints;    // .xyz world position, sampled along a BrazeSpline
+int    _SplineCount;
+float  _SplineRadius;     // tube radius (world units)
+float  _SplineSoft;       // soft edge band (world units)
+StructuredBuffer<float> _SplineProfile;    // radius multiplier along the path length (param 0..1)
+int    _SplineProfileN;
+float  _SplineEndCap;     // fade the tube to nothing over this fraction of length at both ends (0 = rounded caps)
+float  _SplineNoiseAmt;   // fractal break-up of the tube edge (0 = clean tube, 1 = strong bite/wobble)
+float  _SplineNoiseScale; // edge-noise frequency (1 / feature size)
+float  _SplineFlow;       // edge-noise scroll along the path tangent (motion); speed * time, set on the host
+float  _SplineFlatten;    // collapse the cross-section along _SplineFlattenAxis: 0 = round tube, 1 = full-depth wall
+float3 _SplineFlattenAxis;// world axis to extrude the cut through (normalized; usually the spline's up-axis)
+
+float SplineProfileAt(float t)
+{
+    float profile = 1.0;
+    if (_SplineProfileN > 0)
+    {
+        float x = saturate(t) * (_SplineProfileN - 1);
+        int i0 = (int)floor(x); int i1 = min(i0 + 1, _SplineProfileN - 1);
+        profile = lerp(_SplineProfile[i0], _SplineProfile[i1], frac(x));
+    }
+    return profile;
+}
+
+// Smooth tube weight around the world polyline, with a length-varying radius profile + optional soft end-caps.
+float SplineTubeWeight(float3 wp)
+{
+    float weight = 0.0;
+    if (_SplineCount == 1)
+    {
+        float d1 = length(wp - _SplinePoints[0].xyz);
+        float r1 = _SplineRadius * SplineProfileAt(0.5);
+        weight = 1.0 - smoothstep(r1 - _SplineSoft, r1 + _SplineSoft, d1);
+    }
+    else if (_SplineCount > 1)
+    {
+        int segs = _SplineCount - 1;
+        float best = 1e9; float bestT = 0.0; float3 bestTan = float3(0.0, 0.0, 1.0);
+        [loop] for (int i = 0; i < segs; i++)
+        {
+            float3 a = _SplinePoints[i].xyz, b = _SplinePoints[i + 1].xyz;
+            float3 pa = wp - a, ba = b - a;
+            float h = saturate(dot(pa, ba) / max(dot(ba, ba), 1e-6));
+            float3 rad = pa - ba * h;                                              // radial offset from the path
+            rad -= _SplineFlattenAxis * (dot(rad, _SplineFlattenAxis) * _SplineFlatten);   // collapse along axis → wall
+            float d = length(rad);
+            if (d < best) { best = d; bestT = ((float)i + h) / (float)segs; bestTan = normalize(ba + 1e-6); }
+        }
+        float r = _SplineRadius * SplineProfileAt(bestT);
+        // Edge noise: bite/wobble the tube along its length; _SplineFlow scrolls the sample along the path tangent (motion).
+        if (_SplineNoiseAmt > 1e-4)
+        {
+            float3 np = wp * _SplineNoiseScale + bestTan * _SplineFlow;
+            float n = BrazeFbm(np, 0.0) * 2.0 - 1.0;            // ~[-1,1]
+            r *= saturate(1.0 + _SplineNoiseAmt * n);
+        }
+        weight = 1.0 - smoothstep(r - _SplineSoft, r + _SplineSoft, best);
+        if (_SplineEndCap > 1e-4)
+            weight *= smoothstep(0.0, _SplineEndCap, bestT) * smoothstep(0.0, _SplineEndCap, 1.0 - bestT);
+    }
+    return weight;
+}
+
+float FalloffWeight(float3 c)
+{
+    float weight = 1.0;
+    if (_RegionType == 5)               // Spline: a tube around the world-space path
+    {
+        float sw = SplineTubeWeight(mul(_BoxToWorld, float4(c, 1.0)).xyz);
+        weight = _RegionInvert != 0 ? 1.0 - sw : sw;
+    }
+    else if (_RegionType != 4)           // Infinite: whole volume
+    {
+        float3 q = mul(_RegionInv, float4(c, 1.0)).xyz;
+        float d = length(q) - 1.0;
+        if (_RegionType == 1)      d = sdBox(q, float3(1.0, 1.0, 1.0));
+        else if (_RegionType == 2) d = sdCapsule(q, 1.0, 1.0);
+        else if (_RegionType == 3) d = sdCylinder(q, 1.0, 1.0);
+        else                       d = length(q) - 1.0;
+        float region = 1.0 - smoothstep(-_RegionSoft, _RegionSoft, d);
+        weight = _RegionInvert != 0 ? 1.0 - region : region;
+    }
+    return weight;
+}
+
+// ── Noise field ──────────────────────────────────────────────────────────────────────────────────────────
+int   _NoiseMode;        // 0 Erode, 1 Billow, 2 Warp
+int   _NoiseKind;        // 0 Value, 1 Billow, 2 Ridged, 3 Cells, 4 Turbulence, 5 Nebula (ridged multifractal)
+float _NoiseAmount;      // strength
+float _NoiseScale;
+int   _NoiseOctaves;
+float _NoiseLacunarity;
+float _NoisePersistence;
+float _NoiseContrast;    // Edge Hardness: 1 = soft modulation, high = hard binary cuts
+float _NoiseThreshold;   // Coverage bias: iso-level the cut happens at (how much survives)
+float _NoiseWarp;
+float3 _NoiseOffset;
+float _NoiseSeed;
+
+// A non-axis-aligned orthonormal rotation (IQ's fbm matrix). Applied between octaves so the lattices don't stack up
+// into a visible repeating grid — the #1 cause of the "egg-carton" tiling look in fractal/cellular noise.
+static const float3x3 BRZ_FBM_ROT = float3x3(0.00, 0.80, 0.60, -0.80, 0.36, -0.48, -0.60, -0.48, 0.64);
+
+// Cellular F1 + F2 (two nearest feature-point distances) — F2-F1 gives the cell-wall / crack network.
+void WorleyF1F2(float3 p, out float f1, out float f2)
+{
+    float3 ip = floor(p), fp = frac(p);
+    f1 = 1e9; f2 = 1e9;
+    [unroll] for (int z = -1; z <= 1; z++)
+    [unroll] for (int y = -1; y <= 1; y++)
+    [unroll] for (int x = -1; x <= 1; x++)
+    {
+        float3 g = float3(x, y, z);
+        float3 r = g + BrazeHash33(ip + g) - fp;
+        float d = dot(r, r);
+        if (d < f1) { f2 = f1; f1 = d; } else if (d < f2) { f2 = d; }
+    }
+    f1 = sqrt(f1); f2 = sqrt(f2);
+}
+
+// One octave's value in ~[0,1] for the selected basis. Each basis has a distinct character (not just beads).
+float OctaveValue(float3 p, int kind)
+{
+    float value = 0.0;
+    if (kind == 1)
+        value = 1.0 - BrazeWorley(p);                                              // Billow — rounded beads/blobs
+    else if (kind == 3)
+    {
+        float f1 = 0.0, f2 = 0.0;
+        WorleyF1F2(p, f1, f2);
+        value = saturate(f2 - f1);                                                 // Cells — cracked cell walls
+    }
+    else
+    {
+        float vw = saturate(BrazeWave(p.x, p.y, p.z, 0.0) / 0.875 * 0.5 + 0.5);   // value in [0,1]
+        if (kind == 2)      value = 1.0 - abs(vw * 2.0 - 1.0);                     // Ridged — veins / streaks
+        else if (kind == 4) value = abs(vw * 2.0 - 1.0);                           // Turbulence — billowy puffs
+        else                value = vw;                                             // Value FBM — smooth
+    }
+    return value;
+}
+
+// Ridged MULTIFRACTAL (Musgrave) — thin, sharp, BRANCHING filaments: nebula veins / dust lanes / lightning. Each
+// finer octave is weighted by the COARSER ridge (`prev`) so detail rides ON the existing lines rather than spreading
+// everywhere — that's what makes the filaments connected and branching. The cube sharpens each crest to a line, and
+// the final contrast curve CLEARS the troughs to true void so the result reads as veins-in-empty-space, not a solid
+// body. The gate keeps a small floor (0.35) so finer octaves still spawn SUB-veins off the trunks (more lines) while
+// the contrast subtract removes that floor from the voids again (so "more veins" doesn't become "more fill").
+float NebulaRMF(float3 p, int oct, float lac, float gain)
+{
+    float sum = 0.0, amp = 0.55, norm = 0.0, prev = 1.0;
+    [loop] for (int i = 0; i < 10; i++)
+    {
+        if (i >= oct) break;
+        float n = BrazeWave(p.x, p.y, p.z, 0.0) / 0.875;   // ~[-1,1]
+        n = 1.0 - abs(n);                                  // ridge: 1 on the crest line, 0 in the troughs
+        n = saturate(n); n = n * n * n;                    // cube → thin, sharp filament (was square = fatter)
+        sum  += n * amp * prev;                            // weight by the coarser ridge → energy collapses onto it
+        norm += amp;
+        prev  = saturate(0.35 + n);                        // loose gate: finer octaves branch off the trunks (more veins)
+        amp  *= gain;
+        p = mul(BRZ_FBM_ROT, p) * lac + 19.3;              // rotate so octaves don't reinforce into a grid
+    }
+    float v = saturate(sum / max(norm, 1e-4));
+    return saturate((v - 0.18) * 3.5);                     // contrast: clear the voids, isolate the veins (less fill)
+}
+
+float NoiseField(float3 p)
+{
+    float lac = clamp(_NoiseLacunarity, 1.25, 4.0);
+    float gain = clamp(_NoisePersistence, 0.2, 1.0);
+    int oct = clamp(_NoiseOctaves, 1, 10);
+    if (_NoiseWarp > 1e-3) p += BrazeCurlNoise(p * 0.5, 0.3, 0.0) * _NoiseWarp;
+    p = mul(BRZ_FBM_ROT, p);   // tilt the base octave off the box axes too
+
+    float result = 0.0;
+    if (_NoiseKind == 5)
+        result = NebulaRMF(p, oct, lac, gain);   // Nebula: its own multifractal accumulation
+    else
+    {
+        // Base octave owns the broad silhouette at full range; each finer octave ADDS signed crinkle scaled by
+        // Persistence (roughness) at a frequency set by Lacunarity. Unlike a normalised average — which central-limits
+        // toward the mean and washes the finer octaves out — this keeps Octaves / Lacunarity / Persistence clearly visible.
+        result = OctaveValue(p, _NoiseKind);
+        float amp = gain;
+        [loop] for (int i = 1; i < 10; i++)
+        {
+            if (i >= oct) break;
+            p = mul(BRZ_FBM_ROT, p) * lac + 19.3;   // rotate so octaves don't reinforce into a grid
+            result += (OctaveValue(p, _NoiseKind) - 0.5) * amp;
+            amp *= gain;
+        }
+    }
+    return saturate(result);
+}
+
+[numthreads(8, 8, 8)]
+void FilterNoise(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Res)) return;
+    float3 uvw = Uvw(id);
+    float3 c = uvw * 2.0 - 1.0;
+    float density = SampleSrc(uvw);
+    float w = FalloffWeight(c);
+
+    float freq = 1.0 / max(_NoiseScale, 1e-3);
+    float3 p = (uvw * _WorldSize + _NoiseOffset + _NoiseSeed * 19.7) * freq;
+
+    float outD;
+    if (_NoiseMode == 2)
+    {
+        float3 disp = BrazeCurlNoise(p, 0.3, 0.0) * (_NoiseAmount * _NoiseScale / max(_WorldSize.x, 1e-3));
+        outD = SampleSrc(uvw + disp);
+    }
+    else
+    {
+        // Shape the raw noise into a MASK. Erode/Billow use a one-sided threshold; Caves carve a BAND around the
+        // iso-surface n≈Coverage — that iso-set is a connected sheet through the volume, so eroding a band opens
+        // winding tunnels/cavities (the inner cloud carvings). Edge Hardness = tunnel sharpness/width.
+        float n = NoiseField(p);
+        float edge = 0.5 / max(_NoiseContrast, 1e-3);
+        if (_NoiseMode == 1)                                                               // Billow: add lobes
+        {
+            float mask = smoothstep(_NoiseThreshold - edge, _NoiseThreshold + edge, n);
+            outD = density + mask * _NoiseAmount;
+        }
+        else if (_NoiseMode == 3)                                                          // Caves: carve tunnels
+        {
+            float band = 1.0 - smoothstep(0.0, edge + 1e-3, abs(n - _NoiseThreshold));
+            outD = density * (1.0 - saturate(band * _NoiseAmount));
+        }
+        else                                                                               // Erode: carve voids
+        {
+            float mask = smoothstep(_NoiseThreshold - edge, _NoiseThreshold + edge, n);
+            outD = density * lerp(1.0, mask, saturate(_NoiseAmount));
+        }
+    }
+    _Dst[id] = max(lerp(density, outD, w), 0.0);
+}
+
+// ── Density field (Add / Remove / Set) ─────────────────────────────────────────────────────────────────────
+int   _Op;        // 0 Add, 1 Remove, 2 Set
+float _Amount;
+float  _DenNoiseAmt;       // Edge Noise: 0 = clean knife cut, 1 = fully broken-up boundary
+float  _DenNoiseScale;     // feature size (world units)
+float  _DenNoiseContrast;  // soft wobble (1) ↔ hard chunks/holes (high)
+float3 _DenNoiseOffset;    // pattern position (+ flow*time for animation)
+float  _DenNoiseSeed;
+
+[numthreads(8, 8, 8)]
+void FilterDensity(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Res)) return;
+    float3 uvw = Uvw(id);
+    float density = SampleSrc(uvw);
+    float w = FalloffWeight(uvw * 2.0 - 1.0);
+
+    // Edge Noise: displace the falloff weight by fractal noise so the boundary erodes organically instead of cutting
+    // like a knife. CONFINED to the falloff transition by `band` (peaks at the w≈0.5 edge, zero in the solid core and
+    // far outside) — so the noise only chews the EDGE, never the body. Negative noise pulls the edge IN (leaves stray
+    // pockets), positive pushes it OUT (wisps spill). Contrast biases smooth wobble → hard chunks. Amt 0 → clean cut.
+    // The edge band's THICKNESS follows the region's soft edge: widen Region Edge for a fatter noisy boundary.
+    if (_DenNoiseAmt > 1e-4)
+    {
+        float freq = 1.0 / max(_DenNoiseScale, 1e-3);
+        float3 p = (uvw * _WorldSize + _DenNoiseOffset + _DenNoiseSeed * 19.7) * freq;
+        float n = BrazeFbm(p, 0.0);                                  // [0,1]
+        n = saturate((n - 0.5) * _DenNoiseContrast + 0.5);          // contrast: soft ↔ chunky
+        float band = w * (1.0 - w) * 4.0;                           // 1 at the edge, 0 in the core / far outside
+        w = saturate(w + (n * 2.0 - 1.0) * _DenNoiseAmt * band);    // displace ONLY the edge
+    }
+
+    if (_Op == 0)      density += _Amount * w;                       // Add / deposit
+    else if (_Op == 1) density *= (1.0 - saturate(_Amount * w));     // Remove / carve
+    else               density = lerp(density, _Amount, w);          // Set / clamp-to
+    _Dst[id] = max(density, 0.0);
+}
+
+// ── Remap field (opacity / levels) ─────────────────────────────────────────────────────────────────────────
+float _RemapInLow, _RemapInHigh, _RemapGamma, _RemapOutLow, _RemapOutHigh, _RemapContrast;
+int   _RemapInvert;
+
+[numthreads(8, 8, 8)]
+void FilterRemap(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Res)) return;
+    float3 uvw = Uvw(id);
+    float density = SampleSrc(uvw);
+    float w = FalloffWeight(uvw * 2.0 - 1.0);
+
+    float d = saturate((density - _RemapInLow) / max(_RemapInHigh - _RemapInLow, 1e-4));
+    d = pow(d, max(_RemapGamma, 1e-3));
+    if (_RemapContrast != 1.0) d = saturate((d - 0.5) * _RemapContrast + 0.5);
+    if (_RemapInvert != 0) d = 1.0 - d;
+    d = lerp(_RemapOutLow, _RemapOutHigh, d);
+    _Dst[id] = max(lerp(density, d, w), 0.0);
+}
+
+// ── Deform field (mesh-style deformers) ──────────────────────────────────────────────────────────────────
+// Operates in the FIELD's local frame (its transform = the deformer handle), resampling _Src at the inverse-
+// deformed coordinate so the baked field warps without re-generating. Warps use one inverse-resample; the motion
+// blurs accumulate several taps. Blended by the falloff so the deformer has a soft region of influence.
+int   _DeformMode;     // 0 Twist, 1 Bend, 2 Taper, 3 Stretch, 4 Inflate, 5 RadialBlur, 6 DirectionalBlur
+float _DeformAmount;
+int   _DeformAxis;     // local axis the deformation runs along: 0 X, 1 Y, 2 Z
+
+float3 AxisVec(int a) { return (a == 0) ? float3(1, 0, 0) : (a == 2) ? float3(0, 0, 1) : float3(0, 1, 0); }
+
+// Rotate the plane perpendicular to local axis `a` by `ang`.
+float3 RotPerp(float3 q, int a, float ang)
+{
+    float ca = cos(ang), sa = sin(ang);
+    float3 result = float3(q.x * ca - q.y * sa, q.x * sa + q.y * ca, q.z);      // about Z → rotate XY
+    if (a == 1)      result = float3(q.x * ca - q.z * sa, q.y, q.x * sa + q.z * ca); // about Y → rotate XZ
+    else if (a == 0) result = float3(q.x, q.y * ca - q.z * sa, q.y * sa + q.z * ca); // about X → rotate YZ
+    return result;
+}
+
+[numthreads(8, 8, 8)]
+void FilterDeform(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Res)) return;
+    float3 uvw = Uvw(id);
+    float3 c = uvw * 2.0 - 1.0;
+    float w = FalloffWeight(c);
+
+    float3 q = mul(_DeformToLocal, float4(c, 1.0)).xyz;   // deform frame (field rotation/pivot, volume-normalized)
+    int ax = _DeformAxis;
+    float3 axv = AxisVec(ax);
+    float s = dot(q, axv);                            // position along the local axis
+    float a = _DeformAmount;
+
+    float density;
+    if (_DeformMode == 5 || _DeformMode == 6)
+    {
+        // Motion blur: average several taps. Radial = zoom toward the field centre; Directional = along the axis.
+        const int N = 6;
+        float acc = 0.0;
+        [unroll] for (int k = 0; k <= N; k++)
+        {
+            float f = (float)k / N;                                       // 0..1
+            float3 qk = (_DeformMode == 5) ? q * (1.0 - a * 0.7 * f)      // radial / zoom
+                                           : q + axv * (a * 1.5 * (f - 0.5)); // directional
+            acc += SampleSrc(mul(_DeformToBox, float4(qk, 1.0)).xyz * 0.5 + 0.5);
+        }
+        density = lerp(SampleSrc(uvw), acc / (N + 1), w);
+    }
+    else
+    {
+        float3 perp = q - axv * s;
+        float3 q2 = q;
+        // π-scaled rotation so Twist/Bend read as real rotation; scale factors driven directly by Amount (±3 range).
+        if (_DeformMode == 0)      q2 = RotPerp(q, ax, -a * 3.14159265 * s);                 // Twist about the axis ∝ s
+        else if (_DeformMode == 1)
+        {
+            int bendAxis = ax == 2 ? 0 : ax + 1;
+            q2 = RotPerp(q, bendAxis, -a * 3.14159265 * s);                                  // Bend slices ∝ s
+        }
+        else if (_DeformMode == 2) q2 = perp * (1.0 / max(1.0 + a * s, 0.15)) + axv * s;     // Taper cross-section
+        else if (_DeformMode == 3) { float kk = max(1.0 + a, 0.15); q2 = perp * sqrt(kk) + axv * (s / kk); } // Stretch (squash & stretch)
+        else                       q2 = q / max(1.0 + a, 0.15);                              // Inflate outwards (radial)
+
+        density = lerp(SampleSrc(uvw), SampleSrc(mul(_DeformToBox, float4(q2, 1.0)).xyz * 0.5 + 0.5), w);
+    }
+
+    _Dst[id] = max(density, 0.0);
+}
+
+// ── Smooth field (box blur) ────────────────────────────────────────────────────────────────────────────────
+float _SmoothAmount;
+int   _SmoothRadius;
+
+[numthreads(8, 8, 8)]
+void FilterSmooth(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Res)) return;
+    float3 uvw = Uvw(id);
+    float center = SampleSrc(uvw);
+    float w = FalloffWeight(uvw * 2.0 - 1.0);
+    float3 texel = 1.0 / float3(_Res);
+    int r = clamp(_SmoothRadius, 1, 3);
+
+    float sum = 0.0, wsum = 0.0;
+    [loop] for (int z = -3; z <= 3; z++)
+    [loop] for (int y = -3; y <= 3; y++)
+    [loop] for (int x = -3; x <= 3; x++)
+    {
+        if (abs(x) > r || abs(y) > r || abs(z) > r) continue;
+        sum += SampleSrc(uvw + float3(x, y, z) * texel);
+        wsum += 1.0;
+    }
+    float blurred = sum / max(wsum, 1.0);
+    _Dst[id] = max(lerp(center, blurred, saturate(_SmoothAmount) * w), 0.0);
+}
+
+// ── Spline density op (Add / Remove along a path) — uses the shared SplineTubeWeight declared above. ─────────
+int   _SplineOp;        // 0 Add, 1 Remove
+float _SplineAmount;
+
+[numthreads(8, 8, 8)]
+void FilterSplineDensity(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Res)) return;
+    float3 uvw = Uvw(id);
+    float w = SplineTubeWeight(mul(_BoxToWorld, float4(uvw * 2.0 - 1.0, 1.0)).xyz);
+    float density = SampleSrc(uvw);
+    if (_SplineOp == 1) density *= (1.0 - saturate(w * _SplineAmount));   // Remove — carve a tunnel along the path
+    else                density += w * _SplineAmount;                     // Add — deposit a rope of density
+    _Dst[id] = max(density, 0.0);
+}
+
+// ── Occupancy: coarse MAX-pool of the final density, for the renderer's empty-space leaping. Each coarse texel
+// holds the max density over its block, so the raymarcher can skip whole empty cells instead of stepping through them.
+RWTexture3D<float> _OccDst;   // single-channel (RHalf) max-pooled density
+int3 _OccRes;     // coarse texture dimensions
+int3 _OccBlock;   // fine voxels per coarse texel
+Texture3D<float4> _OccDetailNoise;
+SamplerState sampler_OccDetailNoise;
+int _OccWarpEnabled;
+float _OccDetailFreq;
+float _OccDetailWarp;
+
+[numthreads(4, 4, 4)]
+void BuildOccupancy(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_OccRes)) return;
+    int3 start = (int3)id * _OccBlock;
+    float m = 0.0;
+    [loop] for (int z = 0; z < _OccBlock.z; z++)
+    [loop] for (int y = 0; y < _OccBlock.y; y++)
+    [loop] for (int x = 0; x < _OccBlock.x; x++)
+    {
+        int3 c = start + int3(x, y, z);
+        if (any(c >= _Res)) continue;
+        float density;
+        if (_OccWarpEnabled != 0)
+        {
+            float3 uvw = (float3(c) + 0.5) / float3(_Res);
+            float3 pOS = uvw - 0.5;
+            float4 n4 = _OccDetailNoise.SampleLevel(
+                sampler_OccDetailNoise, pOS * _WorldSize * _OccDetailFreq, 0);
+            float3 warped = uvw + (n4.yzw - 0.5) * _OccDetailWarp;
+            density = SampleSrc(warped);
+        }
+        else density = _Src.Load(int4(c, 0));
+        m = max(m, density);
+    }
+    _OccDst[id] = m;
+}
+
+// ── Lighting bake (static volume) ─────────────────────────────────────────────────────────────────────────
+// Self-shadow toward the key light AND sky occlusion (upward) are PRECOMPUTED into a SEPARATE, COARSE light grid
+// (_LightRes ≤ field res — lighting is low-frequency, so a half/quarter-res grid is plenty and the bake is 8–64×
+// cheaper, which kills slider-drag stutter on big volumes). Output: .x = key-light transmittance, .y = sky
+// occlusion, .z = cast-shadow transmittance. Density is read from _Src via trilinear sampling.
+float3 _LbLightDir;   // object-space direction TOWARD the key light (normalized; box is the unit cube)
+float3 _LbWorldSize;  // box world size (for world-correct optical depth)
+int3   _LightRes;     // coarse light-grid dimensions
+int    _LbLightSteps;
+int    _LbAmbSteps;
+float  _LbStep;       // march step in box-normalized units
+float  _LbDensityScale;
+float  _LbShadow;
+float  _LbCastDensity;
+
+float LbDens(float3 uvw) { return max(_Src.SampleLevel(sampler_Src, saturate(uvw), 0), 0.0); }
+
+RWTexture3D<float4> _LightDst;
+
+[numthreads(4, 4, 4)]
+void LightBake(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_LightRes)) return;
+    float3 uvw = (float3(id) + 0.5) / float3(_LightRes);
+
+    // Key-light self-shadow: accumulate optical depth toward the light.
+    float wStep = length(_LbLightDir * _LbWorldSize) * _LbStep;
+    float optical = 0.0;
+    [loop] for (int j = 1; j <= _LbLightSteps; j++)
+    {
+        float3 sp = uvw + _LbLightDir * (_LbStep * (float)j);
+        if (any(sp < 0.0) || any(sp > 1.0)) break;
+        optical += LbDens(sp) * wStep;
+        // Both consumers derive from this same optical integral. Preserve the tail until both are opaque.
+        if (optical * _LbDensityScale * _LbShadow > 8.0 && optical * _LbCastDensity > 8.0) break;
+    }
+    float shadow = exp(-optical * _LbDensityScale * _LbShadow);
+    float castShadow = exp(-optical * _LbCastDensity);
+
+    // Sky occlusion: optical depth straight up (cheap ambient term — darker undersides, lit tops).
+    float wStepA = _LbWorldSize.y * _LbStep;
+    float opticalA = 0.0;
+    [loop] for (int k = 1; k <= _LbAmbSteps; k++)
+    {
+        float sy = uvw.y + _LbStep * (float)k;
+        if (sy > 1.0) break;
+        opticalA += LbDens(float3(uvw.x, sy, uvw.z)) * wStepA;
+    }
+    float ambient = exp(-opticalA * _LbDensityScale * _LbShadow * 0.6);
+
+    _LightDst[id] = float4(shadow, ambient, castShadow, 0.0);
+}
+
+// Filters author only density in R, but the final generated field is already RGBAHalf. Pack the coarse lighting
+// into its unused channels once after the static bake so the hot raymarch gets density + lighting in one 3D tap.
+Texture3D<float4> _PackedLight;
+SamplerState sampler_PackedLight;
+Texture3D<float> _PackedDensity;
+RWTexture3D<float4> _PackedField;
+int3 _PackedRes;
+
+[numthreads(8, 8, 8)]
+void PackGeneratedLighting(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_PackedRes)) return;
+    float3 uvw = (float3(id) + 0.5) / float3(_PackedRes);
+    float density = max(_PackedDensity.Load(int4(id, 0)), 0.0);
+    float3 light = saturate(_PackedLight.SampleLevel(sampler_PackedLight, uvw, 0).xyz);
+    _PackedField[id] = float4(density, light.x, light.y, light.z);
+}
+
+// ── Render-detail tiling noise (static, baked ONCE) ─────────────────────────────────────────────────────────
+// A small SEAMLESS 3D fbm the raymarcher samples in WORLD space (Repeat wrap) to carve crisp, resolution-
+// independent surface grain — the sharpness the bake-time field can't reach. Cheap texture FETCHES at render, no
+// per-sample ALU fbm. RGBA = four decorrelated channels (.x erosion mask, .yzw a warp vector). Lattices wrap at
+// the octave period so the texture is seamless and never visibly repeats.
+float DetailHash(float3 p)
+{
+    p = frac(p * 0.3183099 + 0.1);
+    p *= 17.0;
+    return frac(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+float TileVN(float3 x, float P)
+{
+    float3 i = floor(x), f = frac(x);
+    f = f * f * (3.0 - 2.0 * f);
+    #define BR_TH(o) DetailHash(fmod(i + (o) + P, P))
+    return lerp(lerp(lerp(BR_TH(float3(0,0,0)), BR_TH(float3(1,0,0)), f.x),
+                     lerp(BR_TH(float3(0,1,0)), BR_TH(float3(1,1,0)), f.x), f.y),
+                lerp(lerp(BR_TH(float3(0,0,1)), BR_TH(float3(1,0,1)), f.x),
+                     lerp(BR_TH(float3(0,1,1)), BR_TH(float3(1,1,1)), f.x), f.y), f.z);
+    #undef BR_TH
+}
+int   _TileOctaves;     // how many octaves to blend (1 = fine only; more = bigger structure layered in)
+float _TileRoughness;   // amplitude falloff per finer octave (big↔small balance)
+float _TileSeed;        // reroll the grain pattern
+
+// Multi-octave tiling fbm baked INTO the texture (this loop runs once per bake, NOT per ray-step). The FINEST
+// octave is anchored to the texture dim (its Nyquist) so fine grain is always preserved; coarser octaves are added
+// downward as the layer count grows. Integer power-of-two lattices keep every octave seamless under Repeat.
+float TileFbm(float3 p, float D, float chSeed)
+{
+    int oct = clamp(_TileOctaves, 1, 5);
+    float pers = clamp(_TileRoughness, 0.2, 0.9);
+    float v = 0.0, amp = 1.0, norm = 0.0;
+    [loop] for (int i = 0; i < oct; i++)
+    {
+        int L = max((int)D >> (oct - 1 - i), 1);                    // coarse→fine; finest octave lattice = D
+        float off = chSeed + _TileSeed * 13.7 + (float)i * 7.3;
+        v += amp * TileVN(p * ((float)L / D) + off, (float)L);
+        norm += amp; amp *= pers;
+    }
+    return saturate(v / max(norm, 1e-4));
+}
+RWTexture3D<float4> _TileNoiseOut;
+int _TileDim;
+
+[numthreads(4, 4, 4)]
+void GenTileNoise(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint)_TileDim)) return;
+    float D = (float)_TileDim;
+    float3 p = float3(id);
+    _TileNoiseOut[id] = float4(TileFbm(p, D, 0.0), TileFbm(p, D, 37.3), TileFbm(p, D, 91.7), TileFbm(p, D, 151.1));
+}

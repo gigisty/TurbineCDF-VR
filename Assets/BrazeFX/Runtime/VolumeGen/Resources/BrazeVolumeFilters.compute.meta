@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: bb4843cda396b427fa879aeada4c0c57
+ComputeShaderImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/VolumeGen/Resources/BrazeVolumeFilters.compute
+  uploadId: 959622

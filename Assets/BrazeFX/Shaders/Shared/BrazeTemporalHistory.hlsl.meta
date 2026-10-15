@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: b6c300a4e8674d07880049c69f0f4d64
+ShaderIncludeImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Shaders/Shared/BrazeTemporalHistory.hlsl
+  uploadId: 959622

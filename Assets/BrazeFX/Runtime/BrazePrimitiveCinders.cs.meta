@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 9ed353c493b84ab9828020bcfd8da9fe
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {fileID: 2800000, guid: 16b5b509a1501404d9fd545c4d307d39, type: 3}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/BrazePrimitiveCinders.cs
+  uploadId: 959622

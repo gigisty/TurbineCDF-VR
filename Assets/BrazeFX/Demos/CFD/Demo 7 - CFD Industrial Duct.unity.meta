@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 186c529418b5c4db495a2f3268b20cea
+DefaultImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/CFD/Demo 7 - CFD Industrial Duct.unity
+  uploadId: 959622

@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: bd9d0984f82ba4c3295a3d6d2936c29b
+DefaultImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Dynamic Volumetrics/Demo 12 - Torch - No Domain.unity
+  uploadId: 959622

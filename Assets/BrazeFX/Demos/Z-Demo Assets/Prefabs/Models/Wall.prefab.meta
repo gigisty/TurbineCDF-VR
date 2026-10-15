@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 497cf2773ae1b42679a3bca0d102d512
+PrefabImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Z-Demo Assets/Prefabs/Models/Wall.prefab
+  uploadId: 959622

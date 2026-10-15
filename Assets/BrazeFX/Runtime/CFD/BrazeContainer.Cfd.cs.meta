@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: a8ab7cfa6cbd4b8983a8742d7b0e663e
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/CFD/BrazeContainer.Cfd.cs
+  uploadId: 959622

@@ -1,0 +1,9 @@
+fileFormatVersion: 2
+guid: 941ead3315ee14dd5ac230fa0675f3c5
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/URP/BrazeVolumeCompositePasses.cs
+  uploadId: 959622

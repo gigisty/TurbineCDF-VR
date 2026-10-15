@@ -1,0 +1,20 @@
+{
+    "name": "BrazeFX.Editor",
+    "rootNamespace": "BrazeFX.EditorTools",
+    "references": [
+        "BrazeFX.Runtime",
+        "BrazeFX.URP",
+        "Unity.RenderPipelines.Universal.Runtime"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: e1e72e81959a94dccac060f8066a7f05
+PrefabImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Z-Demo Assets/Prefabs/Models/Low Poly Brick.prefab
+  uploadId: 959622

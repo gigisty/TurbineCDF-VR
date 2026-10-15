@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: f7be9e6a683d48b693b17354089dc55d
+AssemblyDefinitionImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/URP/BrazeFX.URP.asmdef
+  uploadId: 959622

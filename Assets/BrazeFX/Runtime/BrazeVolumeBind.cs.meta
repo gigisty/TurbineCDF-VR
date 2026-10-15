@@ -1,0 +1,9 @@
+fileFormatVersion: 2
+guid: 6a75166ca09a64797b0905bd882a085d
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/BrazeVolumeBind.cs
+  uploadId: 959622

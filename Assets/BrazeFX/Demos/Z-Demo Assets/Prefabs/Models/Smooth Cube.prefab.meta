@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 591170eb9c42949b4b2679d7d79033db
+PrefabImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Z-Demo Assets/Prefabs/Models/Smooth Cube.prefab
+  uploadId: 959622

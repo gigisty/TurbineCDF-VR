@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 13d49d64ecf34ae4a66285089be5c46f
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {fileID: 2800000, guid: a05cf48f9e0734333a48489c9b852013, type: 3}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/BrazeFractureImpactSource.cs
+  uploadId: 959622

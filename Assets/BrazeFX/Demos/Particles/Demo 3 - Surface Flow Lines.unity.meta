@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: e5b6617fc2f2a42a7a7e332a1961c199
+DefaultImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Particles/Demo 3 - Surface Flow Lines.unity
+  uploadId: 959622

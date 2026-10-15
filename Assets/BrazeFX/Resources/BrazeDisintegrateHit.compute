@@ -1,0 +1,77 @@
+// BrazeFX Surface Disintegrator — GPU PROXIMITY hit detection. Each frame: hash the eroder particles into a
+// uniform grid (Scatter), then test every CHUNK vertex against the nearby cells (MarkHits) and flag any clump
+// whose surface a particle is touching. BrazeDisintegrateSim.compute consumes those flags directly on GPU.
+#pragma kernel ClearGrid
+#pragma kernel ClearHits
+#pragma kernel Scatter
+#pragma kernel MarkHits
+
+#define BUCKET 8u   // particles stored per grid cell (overflow is dropped — keep cell size ≈ hit radius)
+
+// The eroder buffer IS a particle system's buffer (bound from BrazeSurfaceDisintegrator), so read it through the
+// shared packed-particle definition + accessors instead of a hand-mirrored struct.
+#include "../Shaders/BrazeParticleStruct.hlsl"
+StructuredBuffer<Particle> _Particles;
+uint   _ParticleCapacity;
+float3 _GridOrigin;
+float  _CellSize;
+uint3  _GridDim;
+uint   _CellTotal;
+RWStructuredBuffer<uint>   _CellNum;     // particles in each cell (atomic, capped at BUCKET)
+RWStructuredBuffer<float3> _CellBucket;  // _CellTotal × BUCKET particle world positions
+
+StructuredBuffer<float3> _DeformedPos;   // per ORIGINAL vertex: current deformed position (world-space when _L2W is identity)
+StructuredBuffer<uint2>  _ShatteredIds;  // per SHATTERED vertex: (clumpId, originalVertexIndex)
+uint     _ShatteredVertCount;
+float4x4 _L2W;
+float    _HitRadius;
+RWStructuredBuffer<uint> _ClumpHit;      // per clump: set to 1 when touched
+uint     _ClumpCount;
+
+uint CellIndex(int3 c) { return (uint)(c.x + c.y * (int)_GridDim.x + c.z * (int)_GridDim.x * (int)_GridDim.y); }
+bool InGrid(int3 c) { return all(c >= 0) && c.x < (int)_GridDim.x && c.y < (int)_GridDim.y && c.z < (int)_GridDim.z; }
+
+[numthreads(64, 1, 1)]
+void ClearGrid(uint3 id : SV_DispatchThreadID) { if (id.x < _CellTotal) _CellNum[id.x] = 0u; }
+
+[numthreads(64, 1, 1)]
+void ClearHits(uint3 id : SV_DispatchThreadID) { if (id.x < _ClumpCount) _ClumpHit[id.x] = 0u; }
+
+[numthreads(64, 1, 1)]
+void Scatter(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _ParticleCapacity) return;
+    Particle part = _Particles[id.x];
+    if (!ParticleAlive(part)) return;                   // dead slot
+    float3 wpos = part.position;                        // world position
+    int3 c = (int3)floor((wpos - _GridOrigin) / _CellSize);
+    if (!InGrid(c)) return;
+    uint ci = CellIndex(c);
+    uint n;
+    InterlockedAdd(_CellNum[ci], 1u, n);
+    if (n < BUCKET) _CellBucket[ci * BUCKET + n] = wpos;
+}
+
+[numthreads(64, 1, 1)]
+void MarkHits(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _ShatteredVertCount) return;
+    uint2 ids = _ShatteredIds[id.x];
+    float3 wp = mul(_L2W, float4(_DeformedPos[ids.y], 1.0)).xyz;
+    int3 c0 = (int3)floor((wp - _GridOrigin) / _CellSize);
+    float r2 = _HitRadius * _HitRadius;
+    [unroll] for (int dz = -1; dz <= 1; dz++)
+    [unroll] for (int dy = -1; dy <= 1; dy++)
+    [unroll] for (int dx = -1; dx <= 1; dx++)
+    {
+        int3 c = c0 + int3(dx, dy, dz);
+        if (!InGrid(c)) continue;
+        uint ci = CellIndex(c);
+        uint n = min(_CellNum[ci], BUCKET);
+        for (uint k = 0; k < n; k++)
+        {
+            float3 d = _CellBucket[ci * BUCKET + k] - wp;
+            if (dot(d, d) <= r2) { _ClumpHit[ids.x] = 1u; return; }
+        }
+    }
+}

@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: eb25d5e5092a345a3885b36121ea8596
+DefaultImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/CFD/Demo 5 - CFD Validation Lab.unity
+  uploadId: 959622

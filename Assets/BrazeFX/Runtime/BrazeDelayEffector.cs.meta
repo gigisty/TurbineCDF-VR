@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 7a4e48f2571c45d0a50436d74753ff29
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {fileID: 2800000, guid: 771ea293e1c49469cb4cd5898f3806fd, type: 3}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/BrazeDelayEffector.cs
+  uploadId: 959622

@@ -1,0 +1,9 @@
+fileFormatVersion: 2
+guid: 54adf4f3563044d24b50e76e64908740
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/BrazeMinMaxCurve.cs
+  uploadId: 959622

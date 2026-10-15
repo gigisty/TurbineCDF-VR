@@ -1,0 +1,55 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 1b7b3ffa462274afd96c5e16043d8e98, type: 3}
+  m_Name: Wall_FractureBake
+  m_EditorClassIdentifier: 
+  signature: 10b194152109f6a6
+  signatureNoMeshSample: 3829286ea976aa3c
+  inputs:
+    geometryVersion: 6
+    meshFingerprint: a62b6fb8b27b68c2
+    meshFingerprintNoSample: a4d4325e46d22880
+    pointCount: 2500
+    seed: 12345
+    fracturePattern: 0
+    patternDirection: {x: 0, y: 1, z: 0}
+    fibreSlenderness: 6
+    secondaryFraction: 0.35
+    impactPoint: {x: 0, y: 0, z: 0}
+    impactRadius: 0.25
+    radialRings: 5
+    radialRays: 14
+    radialJitter: 0.22
+    radialExtent: 0.92
+    distribution: 1
+    variation: 0.7
+    clusterCenter: {x: 0, y: 0, z: 0}
+    clusterRadius: 0.5
+    clusterStrength: 0.7
+    clusterFalloff: 2
+    shaderSource: 0
+    noiseScale: 2
+    noiseSeed: 7
+    densityContrast: 2
+    densityTries: 4
+    neighborK: 96
+    scaleCells: {x: 1, y: 1, z: 1}
+    offsetFragments: 0
+  inputsRecorded: 1
+  fragmentCount: 3819
+  blob: {fileID: 4900000, guid: a8db76f5bfc084a418d2b96894964d0f, type: 3}
+  blobVersion: 1
+  seedCount: 2500
+  vertexCount: 254433
+  triangleCount: 84811
+  neighborLinkCount: 63828
+  payloadBytes: 9546584

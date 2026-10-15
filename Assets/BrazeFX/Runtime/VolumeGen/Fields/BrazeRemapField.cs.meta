@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 79aad2da764d94322a82df3595af9c59
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {fileID: 2800000, guid: b06bd71c4ed9a42498b45e6c0c0f1ba8, type: 3}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/VolumeGen/Fields/BrazeRemapField.cs
+  uploadId: 959622

@@ -1,0 +1,65 @@
+// BrazeFX Mesh Effects — GPU triangle grid build + probe. See BrazeMeshGrid.hlsl for the data model.
+//
+// ClearGrid  — zero the per-bucket counters (one thread per bucket).
+// BuildGrid  — one thread per triangle: covered cells → buckets, atomic-append the triangle id.
+// CopySource — merge a deform source's world-space verts/normals into the shared atlas buffers.
+
+#pragma kernel ClearGrid
+#pragma kernel BuildGrid
+#pragma kernel CopySource
+
+#define BRAZE_GRID_WRITABLE 1
+#include "BrazeMeshGrid.hlsl"
+
+StructuredBuffer<float3> _CopySrcPos;
+StructuredBuffer<float3> _CopySrcNrm;
+RWStructuredBuffer<float3> _CopyDstPos;
+RWStructuredBuffer<float3> _CopyDstNrm;
+uint _CopyCount;
+uint _CopyDstBase;
+
+[numthreads(64, 1, 1)]
+void CopySource(uint3 gid : SV_DispatchThreadID)
+{
+    uint i = BrazeGridFlatIndex(gid);
+    if (i >= _CopyCount) return;
+    _CopyDstPos[_CopyDstBase + i] = _CopySrcPos[i];
+    _CopyDstNrm[_CopyDstBase + i] = _CopySrcNrm[i];
+}
+
+[numthreads(64, 1, 1)]
+void ClearGrid(uint3 gid : SV_DispatchThreadID)
+{
+    uint i = BrazeGridFlatIndex(gid);
+    if (i >= _GridTableSize) return;
+    _GridCellCount[i] = 0u;
+}
+
+[numthreads(64, 1, 1)]
+void BuildGrid(uint3 gid : SV_DispatchThreadID)
+{
+    uint t = BrazeGridFlatIndex(gid);
+    if (t >= _GridTriCount) return;
+
+    uint i0 = _GridIdx[t * 3 + 0], i1 = _GridIdx[t * 3 + 1], i2 = _GridIdx[t * 3 + 2];
+    float3 a = _GridPos[i0], b = _GridPos[i1], c = _GridPos[i2];
+    float3 mn = min(a, min(b, c));
+    float3 mx = max(a, max(b, c));
+    int3 c0 = braze_grid_cell(mn, _GridCellSize);
+    int3 c1 = braze_grid_cell(mx, _GridCellSize);
+
+    [loop]
+    for (int z = c0.z; z <= c1.z; z++)
+    [loop]
+    for (int y = c0.y; y <= c1.y; y++)
+    [loop]
+    for (int x = c0.x; x <= c1.x; x++)
+    {
+        uint h = braze_grid_hash(int3(x, y, z), _GridTableSize);
+        uint slot;
+        InterlockedAdd(_GridCellCount[h], 1u, slot);
+        if (slot < _GridBucketCap) _GridCellItems[h * _GridBucketCap + slot] = t;
+        // overflow past capacity is dropped (counter still counted; query clamps to cap)
+    }
+}
+

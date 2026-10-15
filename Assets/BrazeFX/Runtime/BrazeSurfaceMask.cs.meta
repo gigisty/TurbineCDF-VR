@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 85ea58683dc9c441fa54a02dfb34fae1
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {fileID: 2800000, guid: d692ecccac2484975a2addf2a107c3af, type: 3}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/BrazeSurfaceMask.cs
+  uploadId: 959622

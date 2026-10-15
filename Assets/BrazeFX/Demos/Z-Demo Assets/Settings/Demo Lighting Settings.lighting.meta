@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: 8ab19ee1ac2fc4fafa27defb32d4840a
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 4890085278179872738
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Z-Demo Assets/Settings/Demo Lighting Settings.lighting
+  uploadId: 959622

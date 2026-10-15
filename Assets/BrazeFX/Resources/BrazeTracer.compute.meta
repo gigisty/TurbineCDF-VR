@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 2d54b2faecbd4fcf9cc5dc46fe314682
+ComputeShaderImporter:
+  externalObjects: {}
+  preprocessorOverride: 0
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Resources/BrazeTracer.compute
+  uploadId: 959622

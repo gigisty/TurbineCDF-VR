@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 9d514cec2d24a4fcfac16487b0b5a299
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {fileID: 2800000, guid: c5d9778e8eed34e459d87ffd00bc90be, type: 3}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/VolumeGen/Fields/BrazeSmoothField.cs
+  uploadId: 959622

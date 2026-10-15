@@ -1,0 +1,48 @@
+// BrazeFX Mesh Effects — universal deformed-vertex EXTRACT.
+//
+// The whole point of the growth rewrite: lock onto a mesh's *deformed vertices* and ride them, without
+// caring HOW the mesh is deformed (skeletal skinning, blendshapes, cloth, procedural). The common
+// denominator for every deformer is the same — the engine has already produced a deformed vertex buffer on
+// the GPU. This kernel reads that raw stream (whatever its interleaved layout) and writes CLEAN, world-space
+// float3 position + normal arrays that the rest of the growth system consumes. One pass isolates all the
+// vertex-layout / transform messiness here; everything downstream reads tidy arrays.
+
+#pragma kernel Extract
+
+ByteAddressBuffer _Src;        // raw deformed vertex stream (SkinnedMeshRenderer.GetVertexBuffer / Mesh.GetVertexBuffer)
+RWStructuredBuffer<float3> _OutPos;   // clean world-space positions, indexed by vertex
+RWStructuredBuffer<float3> _OutNrm;   // clean world-space unit normals
+
+uint _VertCount;
+uint _DstBase;     // write offset into the merged arrays (multi-source merge)
+uint _Stride;      // bytes per vertex in the source stream
+uint _PosOffset;   // byte offset of POSITION within a vertex
+uint _NrmOffset;   // byte offset of NORMAL within a vertex
+int  _HasNrm;      // 1 if the stream carries normals at _NrmOffset
+float4x4 _LocalToWorld;   // buffer→world for positions
+float4x4 _NormalMatrix;   // buffer→world for normals (inverse-transpose of the position transform)
+
+uint FlatIndex(uint3 gid, uint rowThreads) { return gid.x + gid.y * rowThreads; }
+uint _RowThreads;
+
+[numthreads(64, 1, 1)]
+void Extract(uint3 gid : SV_DispatchThreadID)
+{
+    uint v = FlatIndex(gid, _RowThreads);
+    if (v >= _VertCount) return;
+
+    uint b = v * _Stride;
+
+    // Position assumed Float32x3 (Unity's skinned output is full-precision; procedural meshes typically too).
+    float3 p = asfloat(_Src.Load3(b + _PosOffset));
+    _OutPos[_DstBase + v] = mul(_LocalToWorld, float4(p, 1.0)).xyz;
+
+    float3 n = float3(0, 1, 0);
+    if (_HasNrm != 0)
+    {
+        float3 ln = asfloat(_Src.Load3(b + _NrmOffset));
+        n = mul((float3x3)_NormalMatrix, ln);
+    }
+    float l = length(n);
+    _OutNrm[_DstBase + v] = l > 1e-8 ? n / l : float3(0, 1, 0);
+}

@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 46323f76be10943cbbaf1549314199e8
+DefaultImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Dynamic Volumetrics/Demo 11 - Surface Mapper Fire.unity
+  uploadId: 959622

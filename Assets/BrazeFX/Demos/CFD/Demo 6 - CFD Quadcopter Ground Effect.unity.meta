@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: f8d81e895c1bf46d9b4edcd5837fcf8f
+DefaultImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/CFD/Demo 6 - CFD Quadcopter Ground Effect.unity
+  uploadId: 959622

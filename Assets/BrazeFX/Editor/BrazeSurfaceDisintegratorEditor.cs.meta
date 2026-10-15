@@ -1,0 +1,9 @@
+fileFormatVersion: 2
+guid: 88975a65b2f8a448c978b85994ac35e4
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Editor/BrazeSurfaceDisintegratorEditor.cs
+  uploadId: 959622

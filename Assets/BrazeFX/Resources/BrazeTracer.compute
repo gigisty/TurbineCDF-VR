@@ -1,0 +1,460 @@
+// BrazeFX Tracer — GPU topology and path-history builder for Cloner positions.
+// The output LineNode/indirect-args contract is shared with BrazeFX/Trail, so topology, history, and rendering
+// remain separate. Clone transforms never leave the GPU.
+
+#pragma kernel CopyClonerPositions
+#pragma kernel ClearTraceHistory
+#pragma kernel AppendTraceHistory
+#pragma kernel BuildNearestPairs
+#pragma kernel BuildConnectionNodes
+#pragma kernel BuildNearestConnectionNodes
+#pragma kernel BuildTraceNodes
+#pragma kernel ClearLineArgs
+#pragma kernel BuildVisibleLines
+
+StructuredBuffer<float4> _CloneBasePosition;
+StructuredBuffer<float4> _ClonePositionOffset;
+RWStructuredBuffer<float4> _TracerPositions;
+RWStructuredBuffer<uint2> _NearestPairs;
+
+struct SourceRange
+{
+    uint start;
+    uint count;
+    uint edgeStart;
+    uint edgeCount;
+};
+StructuredBuffer<SourceRange> _SourceRanges;
+
+struct LineNode
+{
+    float4 posT;
+    float4 color;
+    float4 misc;
+};
+RWStructuredBuffer<LineNode> _LineNodes;
+RWStructuredBuffer<uint> _VisibleLines;
+RWStructuredBuffer<uint> _LineArgs;
+RWStructuredBuffer<float4> _TraceHistory;
+
+uint _CopySourceCount;
+uint _CopyOutputOffset;
+uint _CopyIncludeOrigin;
+float3 _CopyClonerOrigin;
+float4x4 _TracerWorldToLocal;
+
+uint _TotalPositions;
+uint _SourceCount;
+uint _LineCapacity;
+uint _RawEdgeCount;
+uint _NodeCount;
+uint _Segments;
+uint _TracingMode;       // 1 Connect All, 2 Connect Elements, 3 Web, 4 Nearest Points
+uint _SplineType;        // 0 Linear, 1 Cubic, 2 Akima, 3 B-Spline, 4 auto Bezier
+uint _Closed;
+uint _Reverse;
+uint _WebLinks;
+uint _WebStep;
+uint _WebRandom;
+uint _Seed;
+float _MaxDistance;
+
+uint _HistorySamples;
+uint _RingHead;
+uint _RecordedSamples;
+uint _TraceActive;
+uint _LimitMode;
+uint _LimitAmount;
+uint _LimitVariance;
+
+int _RowThreads;
+
+uint FlatIndex(uint3 id)
+{
+    return id.y * (uint)_RowThreads + id.x;
+}
+
+uint Hash(uint value)
+{
+    value ^= value >> 16; value *= 0x7feb352du;
+    value ^= value >> 15; value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return value;
+}
+
+groupshared float3 NearestTile[64];
+
+float3 PositionAt(uint index)
+{
+    return _TracerPositions[min(index, max(_TotalPositions, 1u) - 1u)].xyz;
+}
+
+float3 EvaluateCurve(float3 p0, float3 p1, float3 p2, float3 p3, float t)
+{
+    t = saturate(t);
+    float3 result = lerp(p1, p2, t);
+    float t2 = t * t;
+    float t3 = t2 * t;
+    if (_SplineType == 3u)
+    {
+        float b0 = (1.0 - 3.0 * t + 3.0 * t2 - t3) / 6.0;
+        float b1 = (4.0 - 6.0 * t2 + 3.0 * t3) / 6.0;
+        float b2 = (1.0 + 3.0 * t + 3.0 * t2 - 3.0 * t3) / 6.0;
+        float b3 = t3 / 6.0;
+        result = p0 * b0 + p1 * b1 + p2 * b2 + p3 * b3;
+    }
+    else if (_SplineType == 4u)
+    {
+        // Generated Bezier handles follow the neighbouring chords. This keeps the spline editable-free while
+        // retaining the smooth, segment-local behaviour expected from a procedural Tracer.
+        float span = max(length(p2 - p1), 1e-5);
+        float3 incoming = normalize(p2 - p0 + float3(1e-8, 0.0, 0.0));
+        float3 outgoing = normalize(p3 - p1 + float3(1e-8, 0.0, 0.0));
+        float3 c1 = p1 + incoming * (span / 3.0);
+        float3 c2 = p2 - outgoing * (span / 3.0);
+        float inverseT = 1.0 - t;
+        result = inverseT * inverseT * inverseT * p1
+            + 3.0 * inverseT * inverseT * t * c1
+            + 3.0 * inverseT * t2 * c2
+            + t3 * p2;
+    }
+    else if (_SplineType != 0u)
+    {
+        float3 m1 = (p2 - p0) * 0.5;
+        float3 m2 = (p3 - p1) * 0.5;
+        if (_SplineType == 2u)
+        {
+            // Akima-like bounded tangents: preserve the local direction while preventing tight bends from overshooting.
+            float span = max(length(p2 - p1), 1e-5);
+            float limit = span * 1.5;
+            float l1 = length(m1), l2 = length(m2);
+            if (l1 > limit) m1 *= limit / l1;
+            if (l2 > limit) m2 *= limit / l2;
+        }
+
+        float h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+        float h10 = t3 - 2.0 * t2 + t;
+        float h01 = -2.0 * t3 + 3.0 * t2;
+        float h11 = t3 - t2;
+        result = h00 * p1 + h10 * m1 + h01 * p2 + h11 * m2;
+    }
+    return result;
+}
+
+bool ResolveSourceEdge(uint logicalEdge, out uint sourceIndex, out uint localEdge)
+{
+    sourceIndex = 0u;
+    localEdge = 0u;
+    [loop] for (uint i = 0u; i < _SourceCount; i++)
+    {
+        SourceRange range = _SourceRanges[i];
+        if (logicalEdge >= range.edgeStart && logicalEdge < range.edgeStart + range.edgeCount)
+        {
+            sourceIndex = i;
+            localEdge = logicalEdge - range.edgeStart;
+            return true;
+        }
+    }
+    return false;
+}
+
+uint RangeIndex(SourceRange range, int local)
+{
+    int count = (int)range.count;
+    if (_Closed != 0u && count > 0)
+    {
+        if (local < 0) local += count;
+        else if (local >= count) local -= count;
+    }
+    else
+        local = clamp(local, 0, max(count - 1, 0));
+    return range.start + (uint)local;
+}
+
+bool ResolveConnection(uint logicalEdge, out uint a, out uint b, out uint p0, out uint p3)
+{
+    a = 0u; b = 0u; p0 = 0u; p3 = 0u;
+    bool result = false;
+    if (_TotalPositions >= 2u && _TracingMode == 1u)
+    {
+        uint lastEdge = _TotalPositions - 1u;
+        bool closing = _Closed != 0u && logicalEdge == lastEdge;
+        a = closing ? _TotalPositions - 1u : logicalEdge;
+        b = closing ? 0u : min(logicalEdge + 1u, _TotalPositions - 1u);
+        p0 = a > 0u ? a - 1u : (_Closed != 0u ? _TotalPositions - 1u : a);
+        p3 = b + 1u < _TotalPositions ? b + 1u : (_Closed != 0u ? 0u : b);
+        result = a != b;
+    }
+    else if (_TotalPositions >= 2u)
+    {
+        uint sourceIndex = 0u, localEdge = 0u;
+        bool found = ResolveSourceEdge(logicalEdge, sourceIndex, localEdge);
+        if (found)
+        {
+            SourceRange range = _SourceRanges[sourceIndex];
+            if (range.count >= 2u && _TracingMode == 2u)
+            {
+                uint localA = localEdge;
+                uint localB = (localA + 1u) % range.count;
+                a = RangeIndex(range, (int)localA);
+                b = RangeIndex(range, (int)localB);
+                p0 = RangeIndex(range, (int)localA - 1);
+                p3 = RangeIndex(range, (int)localB + 1);
+                result = a != b;
+            }
+            else if (range.count >= 2u)
+            {
+                uint links = max(_WebLinks, 1u);
+                uint localA = localEdge / links;
+                uint link = localEdge - localA * links;
+                uint offset = 0u;
+                if (localA < range.count)
+                {
+                    if (_WebRandom != 0u)
+                        offset = 1u + Hash(_Seed ^ (range.start + localA) * 0x9e3779b9u ^ link * 0x85ebca6bu) % (range.count - 1u);
+                    else
+                        offset = (max(_WebStep, 1u) * (link + 1u)) % range.count;
+                }
+                if (localA < range.count && offset != 0u)
+                {
+                    uint localB = (localA + offset) % range.count;
+                    a = range.start + localA;
+                    b = range.start + localB;
+                    p0 = a;
+                    p3 = b;
+                    result = a != b;
+                }
+            }
+        }
+    }
+    return result;
+}
+
+[numthreads(64, 1, 1)]
+void CopyClonerPositions(uint3 id : SV_DispatchThreadID)
+{
+    uint local = FlatIndex(id);
+    uint copyCount = _CopySourceCount + _CopyIncludeOrigin;
+    if (local >= copyCount) return;
+    float3 world = local < _CopySourceCount
+        ? _CloneBasePosition[local].xyz + _ClonePositionOffset[local].xyz
+        : _CopyClonerOrigin;
+    _TracerPositions[_CopyOutputOffset + local] = mul(_TracerWorldToLocal, float4(world, 1.0));
+}
+
+[numthreads(64, 1, 1)]
+void ClearTraceHistory(uint3 id : SV_DispatchThreadID)
+{
+    uint flat = FlatIndex(id);
+    uint total = _LineCapacity * _HistorySamples;
+    if (flat < total) _TraceHistory[flat] = float4(0.0, 0.0, 0.0, 0.0);
+}
+
+uint TracedPositionIndex(uint slot)
+{
+    uint result = 0u;
+    if (_TotalPositions > 1u && _LineCapacity > 1u)
+    {
+        float u = ((float)slot + 0.5) / (float)_LineCapacity;
+        result = min((uint)(u * (float)_TotalPositions), _TotalPositions - 1u);
+    }
+    return result;
+}
+
+[numthreads(64, 1, 1)]
+void AppendTraceHistory(uint3 id : SV_DispatchThreadID)
+{
+    uint slot = FlatIndex(id);
+    if (slot >= _LineCapacity || _HistorySamples == 0u) return;
+    uint positionIndex = TracedPositionIndex(slot);
+    float3 p = PositionAt(positionIndex);
+    _TraceHistory[slot * _HistorySamples + _RingHead] = float4(p, _TraceActive != 0u ? 1.0 : 0.0);
+}
+
+// Each selected point performs one tiled, exact nearest-neighbour search. Loading candidate positions once per
+// thread group keeps the lookup on the GPU while avoiding 64 duplicate global-buffer reads per candidate tile.
+[numthreads(64, 1, 1)]
+void BuildNearestPairs(uint3 id : SV_DispatchThreadID, uint3 groupThread : SV_GroupThreadID)
+{
+    uint slot = FlatIndex(id);
+    bool active = slot < _LineCapacity && _RawEdgeCount > 1u;
+    uint pointIndex = 0u;
+    if (active)
+    {
+        float edgeU = ((float)slot + 0.5) / max((float)_LineCapacity, 1.0);
+        pointIndex = min((uint)(edgeU * (float)_RawEdgeCount), _RawEdgeCount - 1u);
+    }
+
+    float3 origin = active ? PositionAt(pointIndex) : 0.0;
+    float nearestDistanceSq = 3.402823466e+38;
+    uint nearest = 0xffffffffu;
+    for (uint tileStart = 0u; tileStart < _TotalPositions; tileStart += 64u)
+    {
+        uint candidate = tileStart + groupThread.x;
+        NearestTile[groupThread.x] = candidate < _TotalPositions ? PositionAt(candidate) : 0.0;
+        GroupMemoryBarrierWithGroupSync();
+
+        uint tileCount = min(64u, _TotalPositions - tileStart);
+        if (active)
+        {
+            [loop] for (uint i = 0u; i < tileCount; i++)
+            {
+                uint candidateIndex = tileStart + i;
+                if (candidateIndex == pointIndex) continue;
+                float3 delta = NearestTile[i] - origin;
+                float distanceSq = dot(delta, delta);
+                if (distanceSq < nearestDistanceSq ||
+                    (distanceSq == nearestDistanceSq && candidateIndex < nearest))
+                {
+                    nearestDistanceSq = distanceSq;
+                    nearest = candidateIndex;
+                }
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (active) _NearestPairs[slot] = uint2(pointIndex, nearest);
+}
+
+[numthreads(64, 1, 1)]
+void BuildConnectionNodes(uint3 id : SV_DispatchThreadID)
+{
+    uint flat = FlatIndex(id);
+    uint total = _LineCapacity * _NodeCount;
+    if (flat >= total || _RawEdgeCount == 0u) return;
+    uint slot = flat / _NodeCount;
+    uint node = flat - slot * _NodeCount;
+    float edgeU = ((float)slot + 0.5) / max((float)_LineCapacity, 1.0);
+    uint logicalEdge = min((uint)(edgeU * (float)_RawEdgeCount), _RawEdgeCount - 1u);
+
+    uint a = 0u, b = 0u, before = 0u, after = 0u;
+    bool valid = ResolveConnection(logicalEdge, a, b, before, after);
+    float3 pa = PositionAt(a);
+    float3 pb = PositionAt(b);
+    if (_MaxDistance > 0.0 && distance(pa, pb) > _MaxDistance) valid = false;
+    float t = _Segments > 0u ? (float)node / (float)_Segments : 0.0;
+    if (_Reverse != 0u) t = 1.0 - t;
+    float3 p = EvaluateCurve(PositionAt(before), pa, pb, PositionAt(after), t);
+
+    LineNode output;
+    output.posT = float4(p, t);
+    output.color = float4(1.0, 1.0, 1.0, 1.0);
+    output.misc = float4(t, -1.0, valid ? 1.0 : 0.0,
+                         frac((float)Hash(_Seed ^ logicalEdge) * (1.0 / 65535.0)));
+    _LineNodes[flat] = output;
+}
+
+[numthreads(64, 1, 1)]
+void BuildNearestConnectionNodes(uint3 id : SV_DispatchThreadID)
+{
+    uint flat = FlatIndex(id);
+    uint total = _LineCapacity * _NodeCount;
+    if (flat >= total) return;
+    uint slot = flat / _NodeCount;
+    uint node = flat - slot * _NodeCount;
+    uint2 pair = _NearestPairs[slot];
+    bool valid = pair.x < _TotalPositions && pair.y < _TotalPositions && pair.x != pair.y;
+    uint a = valid ? pair.x : 0u;
+    uint b = valid ? pair.y : 0u;
+    float3 pa = PositionAt(a);
+    float3 pb = PositionAt(b);
+    if (_MaxDistance > 0.0 && distance(pa, pb) > _MaxDistance) valid = false;
+    float t = _Segments > 0u ? (float)node / (float)_Segments : 0.0;
+    if (_Reverse != 0u) t = 1.0 - t;
+    float3 p = EvaluateCurve(pa, pa, pb, pb, t);
+
+    LineNode output;
+    output.posT = float4(p, t);
+    output.color = float4(1.0, 1.0, 1.0, 1.0);
+    output.misc = float4(t, -1.0, valid ? 1.0 : 0.0,
+                         frac((float)Hash(_Seed ^ pair.x) * (1.0 / 65535.0)));
+    _LineNodes[flat] = output;
+}
+
+uint SlotTraceLength(uint slot)
+{
+    uint available = min(_RecordedSamples, _HistorySamples);
+    uint result = available;
+    if (_LimitMode != 0u)
+    {
+        int variance = (int)_LimitVariance;
+        int signedVariance = variance > 0
+            ? (int)(Hash(_Seed ^ slot * 0x9e3779b9u) % (uint)(variance * 2 + 1)) - variance
+            : 0;
+        uint limit = (uint)max(1, (int)_LimitAmount + signedVariance);
+        result = min(available, limit);
+    }
+    return result;
+}
+
+float4 TraceSample(uint slot, int sample, uint length)
+{
+    float4 result = 0.0;
+    if (sample >= 0 && sample < (int)length && _HistorySamples > 0u)
+    {
+        uint chronological = _Reverse != 0u ? length - 1u - (uint)sample : (uint)sample;
+        uint index = (_RingHead + _HistorySamples - chronological) % _HistorySamples;
+        result = _TraceHistory[slot * _HistorySamples + index];
+    }
+    return result;
+}
+
+[numthreads(64, 1, 1)]
+void BuildTraceNodes(uint3 id : SV_DispatchThreadID)
+{
+    uint flat = FlatIndex(id);
+    uint total = _LineCapacity * _NodeCount;
+    if (flat >= total) return;
+    uint slot = flat / _NodeCount;
+    uint node = flat - slot * _NodeCount;
+    uint length = SlotTraceLength(slot);
+    float t = _Segments > 0u ? (float)node / (float)_Segments : 0.0;
+    float sample = t * (float)max((int)length - 1, 0);
+    int i = (int)floor(sample);
+    float u = sample - (float)i;
+    float4 s0 = TraceSample(slot, i - 1, length);
+    float4 s1 = TraceSample(slot, i, length);
+    float4 s2 = TraceSample(slot, min(i + 1, (int)length - 1), length);
+    float4 s3 = TraceSample(slot, min(i + 2, (int)length - 1), length);
+    if (i <= 0) s0 = s1;
+    if (i + 1 >= (int)length) s2 = s1;
+    if (i + 2 >= (int)length) s3 = s2;
+    bool valid = length >= 2u && s1.w > 0.5 && s2.w > 0.5;
+    float3 p = EvaluateCurve(s0.xyz, s1.xyz, s2.xyz, s3.xyz, u);
+
+    LineNode output;
+    output.posT = float4(p, t);
+    output.color = float4(1.0, 1.0, 1.0, 1.0);
+    output.misc = float4(t, -1.0, valid ? 1.0 : 0.0,
+                         frac((float)Hash(_Seed ^ slot) * (1.0 / 65535.0)));
+    _LineNodes[flat] = output;
+}
+
+[numthreads(1, 1, 1)]
+void ClearLineArgs(uint3 id : SV_DispatchThreadID)
+{
+    _LineArgs[0] = _Segments * 6u;
+    _LineArgs[1] = 0u;
+    _LineArgs[2] = 0u;
+    _LineArgs[3] = 0u;
+    _LineArgs[4] = 0u;
+}
+
+[numthreads(64, 1, 1)]
+void BuildVisibleLines(uint3 id : SV_DispatchThreadID)
+{
+    uint slot = FlatIndex(id);
+    if (slot >= _LineCapacity) return;
+    bool valid = false;
+    for (uint node = 0u; node + 1u < _NodeCount; node++)
+    {
+        bool a = _LineNodes[slot * _NodeCount + node].misc.z > 0.5;
+        bool b = _LineNodes[slot * _NodeCount + node + 1u].misc.z > 0.5;
+        if (a && b) { valid = true; break; }
+    }
+    if (!valid) return;
+    uint destination;
+    InterlockedAdd(_LineArgs[1], 1u, destination);
+    _VisibleLines[destination] = slot;
+}

@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 84cd64f0b3ee4c64b59a9a1a45823af7
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {fileID: 2800000, guid: f74c211d2a1dc484886247ec07561114, type: 3}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/BrazeTargetEffector.cs
+  uploadId: 959622

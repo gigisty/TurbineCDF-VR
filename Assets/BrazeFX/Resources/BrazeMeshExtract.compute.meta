@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: c4b25b666b594482fa594a492a099bca
+ComputeShaderImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Resources/BrazeMeshExtract.compute
+  uploadId: 959622

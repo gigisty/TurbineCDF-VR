@@ -1,0 +1,151 @@
+// ============================================================================
+// BrazeFX slice renderer bakes — self-shadow transmittance + Definition sculpt for the slice raymarch
+// (KShadow + KSculpt; consumes the BrazeFX solver's render field).
+// Reads the solver's RenderField: .x = density (~0..0.3), .w = burn (~0..15);
+// the gain uniforms map those into the froxel domain the kernels were written
+// for (smoke 0..3, fire-temperature 0..1.5), mirroring the shader's MapState.
+//
+// Continuous render occupancy is fused into BrazeSolver.BuildRenderField, so this file never rereads the
+// complete render field merely to build a second coarse mask.
+// ============================================================================
+
+#pragma kernel KShadow
+#pragma kernel KSculpt
+#pragma kernel KClearSculpt
+#pragma kernel KClearRetiredSculpt
+
+SamplerState samplerLinearClamp;
+
+Texture3D<float4> _StateRead;       // BrazeFX RenderField (x density, y temp, z fuel, w burn)
+
+// Self-shadow bake (KShadow): a low-res light-transmittance volume. Screen- and
+// camera-independent -- the renderer reads it with a single tap, so nothing
+// marches along the view ray.
+RWTexture3D<float> _ShadowWrite;
+int3   _ShadowRes;              // resolution of the shadow volume (may be < state res)
+float3 _SimSize;                // container world size (meters)
+float3 _ShadowLightDirLocal;    // normalized, pointing TOWARD the light, container-local
+int    _ShadowSteps;            // light-march taps per voxel
+float  _ShadowStepMeters;       // march step length in meters
+float  _ShadowExtinction;       // extinction per unit smoke (matches the renderer)
+
+// Empty-space-skipping acceleration: a coarse volume holding the MAX visible
+// density (smoke or fire) over each block of render cells. The view march and the
+// shadow bake read it to leap through empty air instead of stepping it. Cheap to
+// build (one full read of the state) and tiny to store.
+int3   _Res;                   // state (RenderField) resolution
+Texture3D<float>   _OccRead;   // sampled during the shadow bake to skip empties
+int    _ShadowUseOcc;          // 1 = shadow march reads _OccRead to skip empty taps
+int    _ShadowCastProjection;  // 1 = empty cells may still carry through-volume transmittance for cast shadows
+
+// Shadow-space density adaptation (the historical shadow bake uses a 3× raw-density mapping).
+float  _StateDensityGain;
+#define SHADOW_DENSITY_REF 5.0 // fixed reference optical density from the old solver lighting bake
+
+// Definition sculpt bake (KSculpt): per-voxel density-gradient shading for the renderer's Definition knob.
+// This used to live in the raymarch loop as a 6-tap central difference PER SAMPLE (the single largest tap
+// cost in the shader); baked per voxel it is the same band-limited, voxel-resolution signal read in one tap.
+// r = sun-facing term (ndl in 0..1), g = gradient-magnitude weight (0..1). The Definition knob itself stays
+// live in the shader (lerp weight), so dragging it needs no rebake.
+RWTexture3D<float2> _SculptWrite;
+float3 _SculptLightDirSim;     // sun dir mapped through the SAME (float3x3)_WorldToSim the shader used, normalized
+StructuredBuffer<uint> _SculptBricks;
+StructuredBuffer<uint> _SculptRetiredBricks;
+int3 _SculptOccRes;
+
+// Bake light transmittance into a low-res volume. For each voxel, march a few
+// fixed steps TOWARD the light through the smoke field and accumulate optical
+// depth; store T = exp(-tau). This is grid-space and screen-independent, so the
+// per-pixel renderer just reads one tap -- self-shadowing never touches the view
+// ray. Dispatched once per frame (optionally every N) from the sim, not per slice.
+[numthreads(8, 4, 4)]   // 128 threads: better latency hiding for the dependent-tap march than the 64-min quantum
+void KShadow(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_ShadowRes)) return;
+
+    // March directly in uvw: fold extinction × normalized step length into one constant
+    // applied at the end, with the early-out threshold pre-divided so the loop test is
+    // a bare compare.
+    float3 su = ((float3)id + 0.5) / (float3)_ShadowRes;
+    // The renderer samples transmittance only where visible smoke/fire exists. Empty current cells are therefore
+    // neutral and can avoid the entire dependent light march; this retains the dense write for simple lifetime.
+    if (_ShadowCastProjection == 0 && _ShadowUseOcc != 0 &&
+        _OccRead.SampleLevel(samplerLinearClamp, su, 0).r < 1e-3)
+    {
+        _ShadowWrite[id] = 1.0;
+        return;
+    }
+    float3 stepUVW = _ShadowLightDirLocal * (_ShadowStepMeters / _SimSize);
+    float maxSim = max(_SimSize.x, max(_SimSize.y, _SimSize.z));
+    float stepNorm = _ShadowStepMeters / max(maxSim, 1e-4);
+    float k = SHADOW_DENSITY_REF * _ShadowExtinction * stepNorm;
+    float odCap = k > 1e-8 ? 6.0 / k : 1e30;   // exp(-6) ~ 0.25%, below the 16-bit target's resolution
+
+    // A shared half-step centres every tap in its interval. The previous low-frequency per-voxel phase noise
+    // imprinted the coarse bake lattice into the transmittance itself; native trilinear reconstruction in the
+    // renderer now supplies the desired smoothness without spatially modulating the light integration.
+    const float jphase = 0.5;
+    float od = 0.0;   // accumulated bounded render density (× k = optical depth)
+    for (int i = 0; i < _ShadowSteps; i++)
+    {
+        float3 tap = su + stepUVW * ((float)i + 1.0 - jphase); // skip own cell, dither within first step
+        if (any(tap < 0.0) || any(tap > 1.0)) break;           // left the container -> unshadowed beyond
+        // Shared empty-space skip: coarse-empty here means no smoke to attenuate, so
+        // the tap would add ~0 -- skip it. (Guarded so an unbound/dummy _OccRead is
+        // never sampled when the feature is off.)
+        if (_ShadowUseOcc != 0 && _OccRead.SampleLevel(samplerLinearClamp, tap, 0).r < 1e-3)
+            continue;
+        // Bounded render-space density, not raw solver density. Raw density plus visible
+        // Density Scale collapses the shadow volume into hard black/white shells.
+        od += saturate(max(_StateRead.SampleLevel(samplerLinearClamp, tap, 0).x, 0.0) * _StateDensityGain);
+        if (od > odCap) break;
+    }
+
+    _ShadowWrite[id] = exp(-od * k);
+}
+
+// Per-voxel Definition sculpt: central-difference density gradient at 1-texel spacing (clamped at the
+// borders, matching the shader's clamp sampler), lit by the sim-space sun direction. Exactly the math the
+// raymarch evaluated per sample; at texel centres the old taps reduce to these same point loads.
+[numthreads(4, 4, 4)]
+void KSculpt(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    // BrazeSolver uses bit 30 to carry scalar-vs-motion support without another GPU buffer/texture.
+    uint packed = _SculptBricks[gid.x] & 0x3fffffffu;
+    uint ox = (uint)_SculptOccRes.x, oy = (uint)_SculptOccRes.y;
+    uint3 brick = uint3(packed % ox, (packed / ox) % oy, packed / (ox * oy));
+    uint3 id = brick * 4u + gtid;
+    if (any(id >= (uint3)_Res)) return;
+    int3 c = (int3)id;
+    int3 lo = int3(0, 0, 0);
+    int3 hi = _Res - 1;
+    float dxp = max(_StateRead[clamp(c + int3(1, 0, 0), lo, hi)].x, 0.0);
+    float dxm = max(_StateRead[clamp(c - int3(1, 0, 0), lo, hi)].x, 0.0);
+    float dyp = max(_StateRead[clamp(c + int3(0, 1, 0), lo, hi)].x, 0.0);
+    float dym = max(_StateRead[clamp(c - int3(0, 1, 0), lo, hi)].x, 0.0);
+    float dzp = max(_StateRead[clamp(c + int3(0, 0, 1), lo, hi)].x, 0.0);
+    float dzm = max(_StateRead[clamp(c - int3(0, 0, 1), lo, hi)].x, 0.0);
+    float3 grad = float3(dxp - dxm, dyp - dym, dzp - dzm);
+    float gmag = length(grad);
+    float3 nrm = -grad / max(gmag, 1e-4);
+    float ndl = dot(nrm, _SculptLightDirSim) * 0.5 + 0.5;
+    _SculptWrite[id] = float2(ndl, smoothstep(0.0, 0.06, gmag));
+}
+
+[numthreads(4, 4, 4)]
+void KClearRetiredSculpt(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint packed = _SculptRetiredBricks[gid.x];
+    uint ox = (uint)_SculptOccRes.x, oy = (uint)_SculptOccRes.y;
+    uint3 brick = uint3(packed % ox, (packed / ox) % oy, packed / (ox * oy));
+    uint3 id = brick * 4u + gtid;
+    if (any(id >= (uint3)_Res)) return;
+    _SculptWrite[id] = 0.0;
+}
+
+[numthreads(4, 4, 4)]
+void KClearSculpt(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Res)) return;
+    _SculptWrite[id] = 0.0;
+}

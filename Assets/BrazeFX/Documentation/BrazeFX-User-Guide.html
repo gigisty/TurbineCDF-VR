@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BrazeFX for Unity — User Guide</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --page: #090b0f;
+      --panel: #11151b;
+      --panel-2: #171d25;
+      --text: #edf2f7;
+      --muted: #aeb9c7;
+      --line: #2a3441;
+      --accent: #ff8a24;
+      --accent-2: #ffc36d;
+      --good: #75d69c;
+      --warn: #ffd166;
+      --code: #080a0e;
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; background: var(--page); color: var(--text); line-height: 1.58; }
+    a { color: var(--accent-2); }
+    code, kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code { background: var(--code); border: 1px solid var(--line); border-radius: .35rem; padding: .08rem .32rem; }
+    kbd { background: #242c37; border: 1px solid #445064; border-bottom-width: 2px; border-radius: .32rem; padding: .08rem .35rem; }
+    header {
+      border-bottom: 1px solid var(--line);
+      background: radial-gradient(circle at 78% 10%, #51240e 0, #18120e 24%, #0c0e12 62%);
+    }
+    .hero { max-width: 1180px; margin: auto; padding: 4.4rem 2rem 3.6rem; }
+    .eyebrow { color: var(--accent); font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
+    h1 { margin: .35rem 0 .7rem; max-width: 900px; font-size: clamp(2.7rem, 7vw, 5.6rem); line-height: .95; letter-spacing: -.055em; }
+    .lede { max-width: 760px; color: var(--muted); font-size: 1.18rem; }
+    .badges { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: 1.6rem; }
+    .badge { border: 1px solid #70401f; border-radius: 999px; background: #24170f; color: #ffd7ad; padding: .34rem .75rem; font-size: .88rem; }
+    .resource-links { display: flex; flex-wrap: wrap; gap: .7rem; margin-top: 1.35rem; }
+    .resource-link { display: inline-flex; align-items: center; border: 1px solid #70401f; border-radius: .55rem; background: #160f0b; color: #ffd7ad; padding: .55rem .8rem; font-weight: 750; text-decoration: none; }
+    .resource-link:hover { border-color: var(--accent); background: #24170f; color: #fff; }
+    .layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); max-width: 1180px; margin: auto; padding: 2rem; gap: 2.4rem; }
+    nav { position: sticky; top: 1rem; align-self: start; padding: 1rem; border: 1px solid var(--line); border-radius: .8rem; background: var(--panel); }
+    nav strong { display: block; margin-bottom: .55rem; color: var(--accent); }
+    nav a { display: block; padding: .28rem .4rem; border-radius: .35rem; color: var(--muted); text-decoration: none; }
+    nav a:hover { background: var(--panel-2); color: var(--text); }
+    main { min-width: 0; }
+    section { scroll-margin-top: 1rem; padding: 1rem 0 2.4rem; border-bottom: 1px solid var(--line); }
+    section:last-child { border: 0; }
+    h2 { margin: 0 0 .75rem; font-size: 2rem; letter-spacing: -.025em; }
+    h3 { margin: 1.65rem 0 .45rem; font-size: 1.18rem; }
+    p, li { color: #d7dee7; }
+    .muted { color: var(--muted); }
+    .callout { margin: 1rem 0; padding: 1rem 1.1rem; border-left: 4px solid var(--accent); border-radius: .25rem .7rem .7rem .25rem; background: var(--panel-2); }
+    .callout.good { border-color: var(--good); }
+    .callout.warn { border-color: var(--warn); }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .8rem; margin: 1rem 0; }
+    .card { padding: 1rem; border: 1px solid var(--line); border-radius: .7rem; background: var(--panel); }
+    .card h3 { margin-top: 0; }
+    .steps { counter-reset: step; list-style: none; padding: 0; }
+    .steps li { position: relative; margin: .9rem 0; padding: .95rem 1rem .95rem 3.4rem; border: 1px solid var(--line); border-radius: .65rem; background: var(--panel); }
+    .steps li::before { counter-increment: step; content: counter(step); position: absolute; left: .9rem; top: .82rem; display: grid; place-items: center; width: 1.7rem; height: 1.7rem; border-radius: 50%; background: var(--accent); color: #1b0b02; font-weight: 900; }
+    .table-wrap { overflow-x: auto; margin: 1rem 0; border: 1px solid var(--line); border-radius: .7rem; }
+    table { width: 100%; border-collapse: collapse; background: var(--panel); font-size: .93rem; }
+    th, td { padding: .72rem .8rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--accent-2); background: #17130f; }
+    tr:last-child td { border-bottom: 0; }
+    .tier { white-space: nowrap; font-weight: 750; }
+    pre { overflow-x: auto; padding: 1rem; border: 1px solid var(--line); border-radius: .7rem; background: var(--code); }
+    details { margin: .7rem 0; border: 1px solid var(--line); border-radius: .65rem; background: var(--panel); }
+    summary { cursor: pointer; padding: .8rem 1rem; font-weight: 750; }
+    details > div { padding: 0 1rem .9rem; }
+    footer { border-top: 1px solid var(--line); color: var(--muted); text-align: center; padding: 2.5rem 1rem 4rem; }
+    @media (max-width: 820px) {
+      .layout { display: block; padding: 1rem; }
+      nav { position: static; margin-bottom: 1.4rem; }
+      .hero { padding: 3rem 1.2rem 2.6rem; }
+    }
+    @media print {
+      :root { color-scheme: light; --page: #fff; --panel: #fff; --panel-2: #f4f4f4; --text: #111; --muted: #444; --line: #ccc; --code: #f4f4f4; }
+      nav { display: none; }
+      .layout { display: block; max-width: none; }
+      header { background: none; }
+      a { color: #8a3c00; }
+      section { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="hero">
+      <div class="eyebrow">BrazeFX for Unity</div>
+      <h1>Fire, smoke, particles and GPU effects.</h1>
+      <p class="lede">A practical guide to installing BrazeFX in URP on Windows or macOS, building a first effect, choosing safe performance settings, exploring the demos, and delivering caches, flipbooks or OpenVDB.</p>
+      <div class="badges">
+        <span class="badge">Unity 6</span>
+        <span class="badge">Universal Render Pipeline</span>
+        <span class="badge">GPU compute</span>
+        <span class="badge">101 demo scenes</span>
+        <span class="badge">Windows &amp; macOS desktop</span>
+      </div>
+      <div class="resource-links" aria-label="BrazeFX online resources">
+        <a class="resource-link" href="https://brazefx.com/" target="_blank" rel="noopener noreferrer">BrazeFX website</a>
+        <a class="resource-link" href="https://brazefx.com/docs" target="_blank" rel="noopener noreferrer">Online documentation</a>
+        <a class="resource-link" href="https://brazefx.com/community" target="_blank" rel="noopener noreferrer">Community &amp; support</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav aria-label="Guide contents">
+      <strong>Contents</strong>
+      <a href="#requirements">Requirements</a>
+      <a href="#install">Install &amp; configure</a>
+      <a href="#first-effect">First fire or smoke</a>
+      <a href="#concepts">Core concepts</a>
+      <a href="#quality">Quality &amp; memory</a>
+      <a href="#toolsets">Toolsets</a>
+      <a href="#export">Bake &amp; export</a>
+      <a href="#demos">Demo index</a>
+      <a href="#troubleshooting">Troubleshooting</a>
+      <a href="#resources">Docs &amp; support</a>
+      <a href="#shipping">Before shipping</a>
+    </nav>
+
+    <main>
+      <section id="requirements">
+        <h2>Requirements and support</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Area</th><th>Supported baseline</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr><td>Unity</td><td>Unity 6, beginning with 6000.0 LTS</td><td>Version 1.0 was validated on supported 6000.0, 6000.3 and 6000.5 releases, with forward checks on 6000.6 beta and 6000.7 alpha.</td></tr>
+              <tr><td>Render pipeline</td><td>URP 17.x</td><td>The Built-in Render Pipeline and HDRP are not supported by the included renderer feature.</td></tr>
+              <tr><td>Packages</td><td>URP/Core and Unity Collections</td><td>Install Unity 6-compatible versions through Package Manager before importing BrazeFX.</td></tr>
+              <tr><td>Desktop platforms</td><td>Windows and macOS</td><td>Editor authoring and Player builds were validated with Direct3D 11 on Windows and Metal on macOS.</td></tr>
+              <tr><td>GPU</td><td>Compute shaders, 3D textures, random-write textures and graphics buffers</td><td>Available grid sizes also depend on 3D-texture, graphics-buffer and GPU-memory limits.</td></tr>
+              <tr><td>OpenVDB interchange</td><td>Managed Editor tooling on Windows and macOS</td><td>Import and export require no native plugin or external OpenVDB installation.</td></tr>
+              <tr><td>Not supported in version 1.0</td><td>Android, iOS/iPadOS, Web/WebGPU, Linux and consoles</td><td>BrazeFX 1.0 does not include or claim runtime support for these platforms.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout"><strong>Preset names are performance tiers, not platform claims.</strong> The renderer’s Mobile and Console presets remain useful for lowering desktop cost, but version 1.0 supports Windows and macOS desktop only.</div>
+        <div class="callout warn"><strong>Start small.</strong> A fluid grid is a 3D allocation. Doubling each axis can increase its principal texture cost by roughly eight times.</div>
+      </section>
+
+      <section id="install">
+        <h2>Install and configure URP</h2>
+        <ol class="steps">
+          <li><strong>Prepare a Unity 6 URP project.</strong> In Package Manager, confirm Universal RP and Unity Collections resolve without compilation errors.</li>
+          <li><strong>Import the BrazeFX package.</strong> Keep the complete <code>Assets/BrazeFX</code> folder together so resources, shaders, demos and editor tooling retain their references.</li>
+          <li><strong>Allow the initial import to finish.</strong> BrazeFX prepares its compute kernels once after import so cold shader compilation does not block normal Play Mode entry. If the project’s Library is rebuilt, use <em>Tools → BrazeFX → Setup → Prepare Compute Kernels</em> and let Unity finish before testing.</li>
+          <li><strong>Configure rendering once.</strong> Choose <em>Tools → BrazeFX → Setup → Configure URP Renderers…</em>. Opening a BrazeFX demo also offers this setup automatically.</li>
+          <li><strong>Review the reported renderer assets.</strong> The command adds the single <em>Braze Render Feature</em> to project-owned renderers referenced by URP Pipeline Assets. Existing renderer features and settings are preserved, and repeating the command does not create duplicates.</li>
+          <li><strong>Confirm the camera uses that renderer.</strong> A camera override pointing to another renderer will not receive the BrazeFX passes.</li>
+        </ol>
+        <p>New renderer features use the performance-first <strong>Mobile</strong> preset: live/cache volumes use 96 maximum steps, 0.5 samples per voxel and half-resolution reconstruction; generated volumes use 64 maximum steps and half-resolution reconstruction. Ray jitter is 0.75 and temporal interleaving is Off. Select <strong>PC</strong> for native-resolution desktop output or <strong>Console</strong> for a lower-cost native-resolution tier. Editing an individual quality field changes the profile to <strong>Custom</strong>. These preset names do not expand version 1.0’s Windows/macOS platform support.</p>
+        <div class="callout warn"><strong>Experimental temporal path:</strong> Slice temporal interleaving is not enabled by any shipping preset because some Unity/URP versions can expose its rotating pixel pattern as checkerboarding. Keep it Off for release-quality output.</div>
+        <p>For luminous fire, enable HDR on the camera/pipeline and add Bloom through the project’s URP post-processing workflow.</p>
+      </section>
+
+      <section id="first-effect">
+        <h2>Create a first fire or smoke effect</h2>
+        <ol class="steps">
+          <li>Choose <strong>GameObject → BrazeFX → Fire → Container</strong>. The menu creates and selects a ready-to-use Container; its transform and Grid define the simulation domain.</li>
+          <li>With the Container selected, choose <strong>GameObject → BrazeFX → Fire → Pyro Emitter</strong> to create it as a child. Start with a primitive source and keep it inside the Container bounds.</li>
+          <li>Choose smoke, temperature and fuel/emission settings on the emitter. Add child Wind, Lift, Turbulence or Vortex components only after the basic source is visible.</li>
+          <li>Select the Container’s <strong>Mobile</strong> or <strong>Realtime</strong> quality preset. Enter Play Mode and inspect the Stats HUD before raising resolution.</li>
+          <li>Frame the effect through a camera using the configured URP renderer. Tune lighting, shadow and raymarch settings after the motion is stable.</li>
+        </ol>
+        <div class="callout good"><strong>Hierarchy rule:</strong> a Container gathers compatible child emitters, forces and obstacles every frame. Keeping each effect grouped under its Container makes the authored relationship obvious.</div>
+      </section>
+
+      <section id="concepts">
+        <h2>Core concepts</h2>
+        <div class="cards">
+          <article class="card"><h3>Container</h3><p>Owns the fluid domain, solver, render proxy, quality budget and child input collection.</p></article>
+          <article class="card"><h3>Emitter</h3><p>Introduces smoke, heat, fire and motion from primitives, mesh surfaces, skinned meshes or fracture fragments.</p></article>
+          <article class="card"><h3>Forces</h3><p>Wind, turbulence, vortices, gravity, lift, jets and other focused motion controls.</p></article>
+          <article class="card"><h3>Obstacle</h3><p>Provides a solid collision boundary. Keep collision detail appropriate to the selected grid resolution.</p></article>
+          <article class="card"><h3>Render Detail</h3><p>A visual warp field that adds apparent detail without creating simulation density.</p></article>
+          <article class="card"><h3>Cache</h3><p>A sparse, render-ready recording for deterministic playback, scrubbing and delivery.</p></article>
+        </div>
+        <p>The solver dispatches work around active occupancy bricks, but its primary fluid state still uses 3D textures. Sparse activity reduces work; it does not make a very large grid free.</p>
+      </section>
+
+      <section id="quality">
+        <h2>Quality, stability and memory</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Mode</th><th>Starting point</th><th>Best for</th><th>Important ceiling</th></tr></thead>
+            <tbody>
+              <tr><td class="tier">Mobile</td><td>64 grid, 30 Hz</td><td>Constrained desktop previews, simple effects and early layout</td><td>256 MB per Container preset budget</td></tr>
+              <tr><td class="tier">Realtime</td><td>128 grid, 60 Hz</td><td>Interactive Windows and macOS desktop work</td><td>2 GB per Container preset budget</td></tr>
+              <tr><td class="tier">Production</td><td>256 grid, 120 Hz</td><td>High-memory desktop GPUs and offline bake/capture</td><td>16 GB per Container preset budget; manual 512 remains production-scale</td></tr>
+              <tr><td class="tier">Custom</td><td>Explicit controls</td><td>Measured project-specific budgets</td><td>The author owns every resolution, CFL, substep, render and memory choice</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout"><strong>Two coordinated quality systems:</strong> Container modes control simulation, detail generation, shadows and memory ceilings. Braze Render Feature presets control the shared camera-space raymarch quality for live/cache and generated volumes.</div>
+        <ul>
+          <li>Use the Container inspector’s allocation estimate before applying a larger grid.</li>
+          <li>Watch scheduled versus required substeps. <strong>LIMITED</strong> means the selected realtime budget is trading stability for cost.</li>
+          <li>Physics Reference Resolution keeps world-space motion consistent while testing different grid resolutions.</li>
+          <li>Profile the target desktop and GPU with the same cameras, lights, shadows, particles and simultaneous Containers used by the shipped scene.</li>
+        </ul>
+      </section>
+
+      <section id="toolsets">
+        <h2>Other BrazeFX toolsets</h2>
+        <details open><summary>GPU particles</summary><div>Use <strong>Braze Particle System</strong> for independent particles or connect particles to fluid motion. Each particle system retains its own duration, rate, looping, burst and spawn-shape controls.</div></details>
+        <details><summary>Procedural volumes</summary><div><strong>Braze Volume</strong> creates static procedural density with field-based noise, density, remap, deformation, smoothing and spline operations, followed by baked lighting and a dedicated URP composite.</div></details>
+        <details><summary>Destruction and disintegration</summary><div>Voronoi fracture supports GPU impact commands, structural connectivity and optional temporary cohesive macro-chunks. Surface disintegration and spread tools provide mesh-driven effect workflows without per-fragment GameObjects.</div></details>
+        <details><summary>CFD visualization</summary><div>CFD scenes demonstrate boundaries, propellers, vehicles, ducts, electronics cooling and architectural flow. Treat these as visualization examples; validate numerical assumptions for any engineering use.</div></details>
+        <details><summary>Motion design and splines</summary><div>Cloners, instances, tracers, effectors, ribbons and spline tools cover procedural layouts and effects that do not require a fluid Container.</div></details>
+      </section>
+
+      <section id="export">
+        <h2>Bake, preview and export</h2>
+        <h3>Game cache clips</h3>
+        <p>Add <strong>Braze Cache Baker</strong> when an effect should play in Unity without running the fluid simulation. The baker records sparse render-ready scalar fields plus velocity in the compact realtime representation. <strong>Frame Skip</strong> defaults to 2: every simulation frame still runs, but only every second frame is stored. <strong>Motion Smoothing</strong> on the Cache Player uses velocity to restore continuous movement between those stored frames.</p>
+        <p>Velocity is enabled by default because it also rebuilds Render Detail at the playing device’s own detail scale. Leave <strong>Velocity Bounds</strong> off for ordinary visual clips; enable it only when particles need motion through clear air or when a complete clear-air velocity halo is required.</p>
+        <h3>Master cache</h3>
+        <ol class="steps">
+          <li>Open <strong>Window → BrazeFX → Export Studio</strong> and bind the source Container.</li>
+          <li>Set the complete simulation <strong>Length</strong> and the blue playback/export Region. Length, In, Out and Blend are authored in frames at the Container’s simulation rate.</li>
+          <li>Choose the working-cache folder. Export Studio intentionally has one master format: lossless scalar fields plus complete velocity, with no stored high-resolution Render Detail texture. Playback, scene preview and flipbook rendering rebuild Render Detail from velocity.</li>
+          <li>Start <strong>Bake Cache</strong> and allow the Studio to enter and exit Play Mode. Scrub the completed cache in Edit Mode; large recordings automatically use a memory-bounded multi-lane stream when full residency is not appropriate. Random seeks remain exact-only, active playback prefetches in its direction, and an underrun buffers instead of permanently chasing the playhead.</li>
+          <li>After delivery, keep the master for deterministic retries, scrubbing and flipbooks, or use <strong>Clear Bake</strong> to remove its verified generated files.</li>
+        </ol>
+        <h3>Flipbook delivery</h3>
+        <p>Select a view, projection, bounds, cell/atlas limits and PNG, TGA or EXR output. Delivery writes an atlas, JSON manifest and <code>BrazeFlipbookAsset</code>; <strong>Create / Update Player</strong> configures playback.</p>
+        <h3>OpenVDB delivery</h3>
+        <p>Select density, temperature, emission and velocity grids. The dependency-free managed exporter writes one numbered <code>.vdb</code> file per selected frame plus a manifest. Its default delivery folder is outside <code>Assets</code>, so Unity does not redundantly import every DCC frame as a project asset. The one Export Studio master is lossless and always contains velocity, making it the authoritative source for these grids.</p>
+        <h3>VDB import</h3>
+        <p>Add <strong>GameObject → BrazeFX → Baking → VDB Import</strong>. Choose a manifest or any numbered frame to import the sequence; a single unnumbered VDB remains a still. Imported runtime data is generated under <code>Assets/BrazeFX Imports</code>.</p>
+        <div class="callout"><strong>Why are cache and VDB sizes different?</strong> The Braze master is a compressed random-access playback source containing renderer-ready scalars and velocity for every stored frame. VDB is a DCC interchange sequence with independently selected sparse grids and metadata. Their compression and access goals differ, so either delivery may be larger depending on the effect and selected grids.</div>
+        <div class="callout"><strong>File safety:</strong> exports use owned staging folders and rollback. Incomplete cache streams use hidden same-volume staging so Unity does not import them. Clear Bake displays and validates the exact generated cache targets before deletion. Keep manually authored files outside generated export/cache destinations.</div>
+      </section>
+
+      <section id="demos">
+        <h2>Demo index</h2>
+        <p>All 101 scenes live under <code>Assets/BrazeFX/Demos</code>. Most begin automatically in Play Mode; there is no universal gameplay input. Use the Scene/Game views and inspect the named hierarchy components to understand each setup. Hardware tiers below are comparative starting points, not guarantees.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Folder</th><th>Scenes</th><th>What it demonstrates</th><th>Starting tier</th></tr></thead>
+            <tbody>
+              <tr><td>Blowers</td><td>6</td><td>Stable, turbulent and burst-driven blower sources.</td><td class="tier">Realtime</td></tr>
+              <tr><td>CFD</td><td>8</td><td>Propellers, aircraft, cars, electronics, validation, ground effect, ducts and architecture.</td><td class="tier">Realtime–High</td></tr>
+              <tr><td>Clouds</td><td>3</td><td>Generated cloud volumes, flythrough and mountain volume composition.</td><td class="tier">Realtime–High</td></tr>
+              <tr><td>Destruction</td><td>7</td><td>Voronoi fracture, particles, pyro, walls, towers, shelves and pillars.</td><td class="tier">Realtime–High</td></tr>
+              <tr><td>Disintegration Effects</td><td>2</td><td>Skinned-mesh disintegration with particle and fire variants.</td><td class="tier">Realtime</td></tr>
+              <tr><td>Dynamic Volumetrics</td><td>12</td><td>Vortices, portals, surface mapping and torch effects with and without domains.</td><td class="tier">Mobile–Realtime</td></tr>
+              <tr><td>Jets</td><td>12</td><td>Calm/turbulent jets and ignition success/failure behaviours.</td><td class="tier">Realtime</td></tr>
+              <tr><td>Large Fires</td><td>16</td><td>Dragon breath, blasts, mushrooms, billows and interacting large sources.</td><td class="tier">High</td></tr>
+              <tr><td>Magic Effects</td><td>4</td><td>Container-free portals, volumetric spinners, sword fire and ribbons.</td><td class="tier">Mobile–Realtime</td></tr>
+              <tr><td>Massive Effects</td><td>7</td><td>Rotor wash/downwash, obstacles, ice, rocket launch and fireball scenes.</td><td class="tier">High</td></tr>
+              <tr><td>Motion Design</td><td>11</td><td>Grids, radial/spherical forms, fields, tunnels, clustering and growth.</td><td class="tier">Realtime</td></tr>
+              <tr><td>Particles</td><td>4</td><td>Colored particles, surface flow lines and swirls.</td><td class="tier">Mobile–Realtime</td></tr>
+              <tr><td>Space Effects</td><td>5</td><td>Debris, turbines and generated nebula environments.</td><td class="tier">Realtime–High</td></tr>
+              <tr><td>Vehicle Effects</td><td>4</td><td>Drift, tire burn, container-free smoke and spinning-car variants.</td><td class="tier">Realtime</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="troubleshooting">
+        <h2>Troubleshooting</h2>
+        <details open><summary>The effect simulates but is not visible</summary><div>Run <strong>Tools → BrazeFX → Setup → Configure URP Renderers…</strong>, then confirm the camera uses one of the configured renderers and the required feature pass is enabled. If a camera overrides its renderer, configure that asset too. Also check camera culling masks and Container bounds.</div></details>
+        <details><summary>Live smoke shows checkerboarding or looks too soft</summary><div>Select the Braze Render Feature and choose the <strong>PC</strong> preset. Confirm Live / Cache Volumes uses Resolution Divisor 1 and Temporal Interleaving Off. Divisor 2 is a deliberate mobile/performance trade, and temporal interleaving remains experimental.</div></details>
+        <details><summary>The first Play Mode entry is compiling or takes unusually long</summary><div>Allow the initial package import and compute-kernel preparation to complete before entering Play Mode. After deleting or rebuilding the Library, run <strong>Tools → BrazeFX → Setup → Prepare Compute Kernels</strong> once. Normal later Play Mode entry should not repeatedly cold-compile the complete kernel set.</div></details>
+        <details><summary>The project has missing assembly references</summary><div>Install Unity 6-compatible Universal RP and Unity Collections packages. BrazeFX is authored for URP and directly references those assemblies.</div></details>
+        <details><summary>A CFD mesh SDF kernel is unsupported</summary><div>Use a supported Windows Direct3D 11 or macOS Metal project and let shader import finish. BrazeFX disables an unsupported CFD mesh-SDF bake after one actionable error instead of repeatedly dispatching an invalid kernel. Android, Web, Linux and other unqualified graphics backends are not supported in version 1.0.</div></details>
+        <details><summary>A Player build reports outdated URP Global Settings</summary><div>Upgrade the project-owned Universal Render Pipeline Global Settings asset with the current Unity version before building. Do not reuse or downgrade the same test project across Unity versions; create a fresh project for each compatibility check.</div></details>
+        <details><summary>The Container refuses a resolution</summary><div>The request exceeds the selected quality preset or the device’s texture/buffer limit. Lower the grid, select an appropriate preset, or use Custom only after measuring the complete allocation.</div></details>
+        <details><summary>Motion becomes unstable or the HUD says LIMITED</summary><div>Reduce forces or grid resolution, raise the allowed substep budget, or use a stricter quality mode. Required substeps above the scheduled ceiling are an explicit stability/performance trade.</div></details>
+        <details><summary>VDB export is disabled</summary><div>Use a supported Editor host and ensure the Export Studio master and selected grids are valid. If the session references an older scalar-only or realtime-quantized cache, bake a fresh master in the current Export Studio.</div></details>
+        <details><summary>A cache cannot be found after moving the project</summary><div>Keep a relative <code>.brazecache</code> beside its cache asset for portable in-project data. External absolute cache paths are machine-specific and must remain available.</div></details>
+        <details><summary>Performance drops with several effects</summary><div>Profile total grid memory, render steps, lights, shadows, particle counts and simultaneous Containers. Lower the cost of the largest domains before micro-optimizing small sources.</div></details>
+      </section>
+
+      <section id="resources">
+        <h2>Documentation, community and support</h2>
+        <p>This offline guide ships with every BrazeFX package and remains available without an Internet connection. The living online documentation provides the expanded component reference, workflow articles and updates.</p>
+        <div class="cards">
+          <article class="card">
+            <h3>Website</h3>
+            <p>Product information, demonstrations and release news.</p>
+            <p><a href="https://brazefx.com/" target="_blank" rel="noopener noreferrer">https://brazefx.com/</a></p>
+          </article>
+          <article class="card">
+            <h3>Online documentation</h3>
+            <p>Expanded Unity component and workflow documentation.</p>
+            <p><a href="https://brazefx.com/docs" target="_blank" rel="noopener noreferrer">https://brazefx.com/docs</a></p>
+          </article>
+          <article class="card">
+            <h3>Community &amp; support</h3>
+            <p>Ask questions, report bugs, request features and share work.</p>
+            <p><a href="https://brazefx.com/community" target="_blank" rel="noopener noreferrer">https://brazefx.com/community</a></p>
+          </article>
+        </div>
+        <p>For direct enquiries, email <a href="mailto:hello@brazefx.com">hello@brazefx.com</a>. When reporting a technical issue, include the BrazeFX version, Unity version, operating system, graphics API, GPU, reproduction steps, Console output and a screenshot or short capture.</p>
+      </section>
+
+      <section id="shipping">
+        <h2>Before shipping a project</h2>
+        <ul>
+          <li>Ship BrazeFX 1.0 only on its supported Windows or macOS desktop targets. Test the exact runtime graphics API and representative GPU; Editor success alone is not a runtime certification.</li>
+          <li>Confirm every camera uses the intended URP Renderer and that unused renderer passes are disabled.</li>
+          <li>Profile peak GPU memory while the most expensive effects overlap.</li>
+          <li>Prefer baked/cache playback when a deterministic effect does not need live simulation.</li>
+          <li>Keep package third-party notices with redistributed BrazeFX content and review the project’s own asset licences.</li>
+          <li>Do not ship development caches, VDB sequences or exports unless the player genuinely consumes them.</li>
+        </ul>
+        <p class="muted">Guide baseline: BrazeFX 1.0.0, 24 July 2026.</p>
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    BrazeFX for Unity · Local customer guide ·
+    <a href="https://brazefx.com/" target="_blank" rel="noopener noreferrer">Website</a> ·
+    <a href="https://brazefx.com/docs" target="_blank" rel="noopener noreferrer">Documentation</a> ·
+    <a href="https://brazefx.com/community" target="_blank" rel="noopener noreferrer">Community</a>
+  </footer>
+</body>
+</html>

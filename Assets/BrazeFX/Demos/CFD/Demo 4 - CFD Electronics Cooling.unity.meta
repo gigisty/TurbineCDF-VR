@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: c849490263c6f4d45bb9588652105745
+DefaultImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/CFD/Demo 4 - CFD Electronics Cooling.unity
+  uploadId: 959622

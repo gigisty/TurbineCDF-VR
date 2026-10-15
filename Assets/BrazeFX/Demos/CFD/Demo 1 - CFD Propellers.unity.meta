@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 397f5c6be7255472fb3c02f46bef5bd9
+DefaultImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/CFD/Demo 1 - CFD Propellers.unity
+  uploadId: 959622

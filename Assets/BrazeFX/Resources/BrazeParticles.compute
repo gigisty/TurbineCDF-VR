@@ -1,0 +1,1881 @@
+// BrazeFX GPU particle system — compute core.
+//
+// Adapted from the publisher-owned WebGPU prototype three-js-particles: a 64-byte particle with
+// CLEAR / EMIT / SIMULATE / COMPACT kernels. This is the Unity HLSL port; module behaviour is
+// inlined and uniform-gated (Unity can't compile compute from strings in builds), so the
+// "module manifest" concept lives C#-side (uniforms + LUTs + enable bits).
+//
+// emission SHAPES (sphere/hemisphere/cone/box/circle/plane/terrain/torus plus GPU mesh/cloner sources)
+// + over-lifetime modules (velocity / size / opacity / colour) via baked
+// 256×1 LUTs (RGFloat curves + an RGBA gradient), each uniform-gated. Sprites/soft particles (M4)
+// and effectors (forces) are done; colliders/events and spawn-time emitter motion inheritance are handled here.
+//
+// Particle layout (64 B):
+//   position : float4  xyz = position, w = total lifetime (0 = empty slot)
+//   velocity : float4  xyz = velocity, w = age (seconds)
+//   color    : float4  rgba
+//   params   : float4  x = startSize, y = size, z = rotation, w = asfloat(seed u32)
+
+#pragma kernel Clear
+#pragma kernel ResetArgs
+#pragma kernel Emit
+#pragma kernel EmitRequests
+#pragma kernel ClearReqCount
+#pragma kernel Simulate
+#pragma kernel FlowConstrain
+#pragma kernel Compact
+#pragma kernel SortInit
+#pragma kernel SortStep
+#pragma kernel SortScatter
+#pragma kernel WriteMeshArgs
+#pragma kernel MeshCullReset
+#pragma kernel MeshCull
+#pragma kernel ExtractSkinnedEmit
+#pragma kernel ExtractSkinnedSamples
+#pragma kernel CaptureClonerEmit
+#pragma kernel MaskGate
+#pragma kernel SepClearGrid
+#pragma kernel SepWriteArgs
+#pragma kernel SepBuildGrid
+#pragma kernel SepSolve
+#pragma kernel SepApply
+
+// Shared mask field (same code the preview shader runs) — the GPU gate evaluates membership per rest vertex.
+#include "../Shaders/BrazeMaskField.hlsl"
+
+// Packed 48-byte particle record + pack/unpack accessors (shared with the render shaders + trail build).
+#include "../Shaders/BrazeParticleStruct.hlsl"
+
+RWStructuredBuffer<Particle> _Particles;
+RWStructuredBuffer<uint>     _VisibleIndices;
+RWStructuredBuffer<uint>     _Indirect;
+RWStructuredBuffer<uint>     _Head;       // particle-ring allocation head (persistent; atomically advanced)
+
+// Mesh render mode (Graphics.RenderMeshIndirect): WriteMeshArgs copies the alive count (Compact wrote it into
+// _Indirect[1]) into each mesh's draw command so RenderMeshIndirect instances exactly the alive particles.
+struct DrawArgs { uint indexCount; uint instanceCount; uint startIndex; uint baseVertex; uint startInstance; };
+RWStructuredBuffer<DrawArgs> _MeshArgsOut;
+uint _MeshArgCount;
+
+// Mesh-mode frustum culling: MeshCull compacts the on-screen alive particles into _MeshCullVisible (count in
+// _MeshCullCount[0]); the mesh draws then instance only that visible count, and the shader indexes this list
+// instead of the full alive list. Cost scales with what the camera sees, not the whole pool.
+RWStructuredBuffer<uint> _MeshCullVisible;
+RWStructuredBuffer<uint> _MeshCullCount;     // [0] = visible count (grown atomically)
+float4   _MeshCullPlanes[6];                 // camera frustum (xyz normal, w d); inside ⇔ dot(n,p)+d ≥ 0
+float4x4 _MeshCullModel;                     // sim→world (matches the draw's _Model)
+float    _MeshCullScale;                     // per-particle bounding radius = params.y × this
+uint     _MeshCullOn;                        // 0 = pass everything (culling disabled), 1 = frustum test
+
+uint   _Capacity;
+uint   _VertexCount;   // verts emitted per visible particle by the indirect draw (6 = sprite quad; mesh = max index count)
+uint   _RowThreads;    // threads per dispatch row (groupsX × 64) — lets a 2D grid exceed the 65535 group cap
+float  _Dt;
+
+// Event/sub-source emission: particle events and mesh effects append SpawnRequests into a target system's buffer;
+// that system drains them next frame (EmitRequests) into fresh particles. All GPU-side, no readback.
+struct SpawnRequest
+{
+    float4 position;   // xyz spawn position, w = asfloat(flags): bit0 add request velocity, bit1 inherit colour
+    float4 velocity;   // xyz source velocity to add when bit0 is set
+    float4 color;      // parent colour
+};
+RWStructuredBuffer<SpawnRequest> _Requests;
+RWStructuredBuffer<uint>         _ReqCount;     // [0] = append head for this frame's requests
+uint  _ReqCapacity;                             // hard cap on requests per frame (overflow dropped)
+
+// ---- Attachment (optional): a request-driven emitter can rigidly bind each spawned particle to a source
+// rigid body (e.g. a Voronoi Fracture chunk) so it RIDES the chunk's motion instead of flying free. Fully gated
+// by _AttachEnable — when 0 the simulation never reads live attachment, so standalone particle systems are unaffected.
+uint _AttachEnable;                          // 0 = off (no live attachment this dispatch)
+uint _AttachWriteEnable;                     // 1 = _Attach is capacity-sized and spawn slots can be cleared/written
+uint _AttachCount;                           // number of source bodies (bounds check on the packed index)
+StructuredBuffer<float4>   _AttachPosState;  // [body] xyz world position, w state   (= master _ClumpPosState)
+StructuredBuffer<float4>   _AttachRot;       // [body] world quaternion               (= master _ClumpRot)
+RWStructuredBuffer<float4> _Attach;          // [slot] xyz body-local offset, w = bodyIndex+1 (0 = not attached)
+
+// On Death event: op 0 none, 1 spawn particles (into target), 2 fire Unity event (capped sample).
+uint  _OnDeathOp;
+int   _OnDeathCount;
+float _OnDeathChance;        // 0..1 per-particle probability
+uint  _OnDeathInherit;       // bit1 colour
+float _OnDeathPosJitter;     // random spawn-position scatter radius (world units)
+
+// CPU event channel — a capped sample of world positions read back to fire UnityEvents (≤ _EventCapacity/frame).
+RWStructuredBuffer<float4> _EventPos;     // xyz = world position, w = 1 when the slot is used
+RWStructuredBuffer<uint>   _EventCount;   // atomic slot allocator (not read back; reset each frame)
+uint _EventCapacity;
+
+// On Collision event: a capped CPU sample of HIT world positions (e.g. to seed a surface spread). Op 0 none,
+// 2 fire event. Fires at most once per particle per frame (first contact). Shares _EventCapacity.
+uint  _OnCollisionOp;                     // bit0 = spawn particles, bit1 = fire event (independent)
+float _OnCollisionChance;                 // 0..1 per-particle probability
+int   _OnCollisionCount;                  // particles spawned per hit (spawn bit)
+uint  _OnCollisionInherit;                // bit1 = inherit colour
+float _OnCollisionPosJitter;              // spawn scatter radius (world units)
+RWStructuredBuffer<float4> _CollisionEventPos;    // xyz = hit world position, w = 1 when the slot is used
+RWStructuredBuffer<uint>   _CollisionEventCount;  // atomic slot allocator (reset each frame)
+
+// Mesh-surface collision: collide particles against the actual (deforming) mesh surface via the shared
+// hashed triangle grid (BrazeMeshGrid, rebuilt each frame from the collider renderer's evaluated verts).
+#include "BrazeMeshGrid.hlsl"
+uint   _MeshCollide;
+float  _MeshContactRange;                 // grid query reach (must cover the largest particle contact radius)
+float4 _MeshResponse;                     // bounce, friction, strength, _
+
+// Flatten a 2D dispatch (numthreads 64×1×1) back to a linear particle index.
+uint FlatIndex(uint3 gid) { return gid.x + gid.y * _RowThreads; }
+
+// Emission / start (the three-js-particles "main" module, sampled at t=0).
+uint     _EmitCount;
+uint     _FrameSeed;
+float4x4 _EmitToWorld;     // system localToWorld; bakes position/rotation/scale into the spawn
+float2   _StartLifetimeR;  // (min, max) band sampled per particle at spawn
+uint     _InfiniteLife;    // 1 = particles never die; over-life modules are bypassed (use start appearance)
+float2   _StartSpeedR;
+float2   _StartSizeR;
+float2   _StartRotR;
+float4   _StartColor;
+
+// Shape module.
+uint   _ShapeKind;     // 0 sphere,1 hemisphere,2 cone,3 box,4 circle,5 plane,6 terrain,7 torus,8 mesh,9 cylinder,10 capsule,11 emitter cone,12 cloner
+float  _ShapeRadius;   // also torus major radius
+float  _ShapeAngle;    // cone half-angle (radians)
+float3 _ShapeBox;      // box half-extents
+float2 _ShapePlane;    // plane / terrain full size (XZ)
+float  _ShapeTerrainH; // terrain displacement amplitude
+float  _ShapeTerrainF; // terrain spatial frequency
+float  _ShapeTorusThickness; // torus minor (tube) radius
+float  _ShapeHeight;   // cylinder / capsule / emitter-cone height
+uint   _ShapeShell;    // 0 = volume, 1 = surface/shell
+StructuredBuffer<float3> _EmitPoints;      // Mesh shape: WORLD-space surface points (Surface Mapper mask or whole mesh)
+StructuredBuffer<float3> _EmitNormals;     // Mesh shape: matching WORLD-space surface normals (emit direction)
+StructuredBuffer<float3> _EmitVelocities;  // Mesh shape: matching WORLD-space surface velocities (motion to inherit)
+uint   _EmitPointCount;
+float  _EmitInherit;   // signed source-motion response: negative = trail, 0 = detach, positive = follow
+// Cloner shape: final transforms are shared directly from BrazeCloner. Positions are world-space; the combined
+// clone rotation turns local +Y into the initial emission direction. Previous positions provide inherited motion.
+StructuredBuffer<float4>   _EmitClonerBasePosition;
+StructuredBuffer<float4>   _EmitClonerPositionOffset;
+StructuredBuffer<float4>   _EmitClonerBaseRotation;
+StructuredBuffer<float4>   _EmitClonerRotationOffset;
+RWStructuredBuffer<float4> _EmitClonerPreviousPosition;
+uint  _EmitClonerCount;
+uint  _EmitClonerHasPrevious;
+float _EmitClonerInvDt;
+// Masked GPU emission: _EmitPoints holds ALL deformed verts (world space); _EmitPassIdx[0.._EmitPointCount) lists the
+// vertex indices that fall inside the Surface Mask, so spawns are drawn only from the masked region without a CPU bake.
+StructuredBuffer<uint> _EmitPassIdx;
+uint   _EmitUsePassIdx;
+StructuredBuffer<uint> _PassCountRO;   // masked GPU emission: live pass-vertex count written by the MaskGate kernel
+// Static/sample-driven mesh emission keeps samples in mesh-local rest space and lets the GPU transform them at birth.
+// That keeps mask-driven emission CPU-independent at runtime while still inheriting rigid source motion.
+uint     _EmitInputLocal;
+uint     _EmitHasPrevLocal;
+float4x4 _EmitLocalToWorld;
+float4x4 _EmitPrevLocalToWorld;
+float4x4 _EmitNormalLocalToWorld;
+float    _EmitLocalInvDt;
+float    _EmitExtraNormalVelocity;
+
+// Optional spawn-time motion inherited from a connected BrazeEmitter. This is a single uniform term plus
+// emitter-centered radial velocity; particles do not sample the fluid container after birth.
+uint   _EmitterMotionEnable;
+float3 _EmitterMotionVelocity;
+float3 _EmitterMotionCenter;
+float  _EmitterMotionRadial;
+
+// Over-lifetime modules (enable bits + LUTs).
+uint _VolEnable, _SolEnable, _OolEnable, _ColEnable, _CbsEnable;
+Texture2D<float2> _VolXLut;
+Texture2D<float2> _VolYLut;
+Texture2D<float2> _VolZLut;
+Texture2D<float2> _SolLut;
+Texture2D<float2> _OolLut;
+Texture2D<float4> _ColLut;   // colour-over-life gradient (256×1 RGBA), multiplies the start colour
+Texture2D<float4> _CbsLut;   // colour-by-speed gradient (256×1 RGBA)
+float2 _CbsRange;            // speed (min, max) remapped to 0..1 before sampling _CbsLut
+
+// Mesh rotation is simulation state, not a render-time age formula. Integrating angular velocity each frame keeps
+// Spin by Speed continuous when collisions/forces change speed, and lets resting-contact sleep stop rotation.
+uint  _MeshRotationEnable;
+float _MeshSpin;
+float _MeshSpinBySpeed;
+
+// Forces (the three-js-particles "effectors"): per-particle world-space pushes. Gathered per system.
+struct GpuForce
+{
+    float4 position;   // xyz position, w = type (0 wind, 1 radial, 2 vortex, 3 drag, 4 turbulence)
+    float4 direction;  // xyz wind dir / vortex axis, w = strength
+    float4 boxHalf;    // xyz box half-extents, w = sphere radius
+    float4 rot;        // region orientation (world quaternion)
+    float4 misc;       // x = shape, y = falloff LUT row, z = hold response (vortex), w = vortex mode
+    float4 jitter;     // x = centre jitter, y = direction jitter, z = strength jitter, w = orbit radius (vortex)
+    float4 extra;      // turbulence: x = detail, y = scale (wave size), z = scale-random, w = unused
+};
+StructuredBuffer<GpuForce> _Forces;
+uint _ForceCount;
+StructuredBuffer<float> _ForceFalloff;   // forceCount × 256, flat (row*256 + col): each force's centre→edge curve
+float _TurbTime;                         // wall-clock time driving the turbulence curl field (keeps it "alive")
+
+// ── Fluid-follow: advect particles along a BrazeContainer's live velocity field (the smoke/fire motion) ──
+// The field is already on the GPU (the solver's velocity texture), so this is just a trilinear sample per
+// particle — no extra simulation cost. Gated by the fluid's content mask so particles OUTSIDE the smoke keep
+// their own motion instead of being dragged to a halt by the empty (zero-velocity) field around it.
+Texture3D<float4> _FluidVel;          // container velocity field, VOXELS/sec in .xyz
+Texture3D<float>  _FluidOcc;          // dilated occupancy (content mask) — where fluid actually exists
+SamplerState sampler_LinearClamp;     // Unity inline trilinear-clamp sampler
+uint     _FluidFollowEnable;
+float    _FluidFollowK;               // per-frame blend toward fluid velocity (dt-corrected on the CPU)
+float    _FluidFollowGain;            // multiplier on the fluid velocity the particle chases (1 = as-is, >1 = exaggerated)
+float    _FluidFollowRand;            // 0..1 per-particle variation on follow tightness (some lag, some lock on)
+float    _FluidFollowGainRand;        // 0..1 per-particle ± variation on the boost (spread of fling distances)
+float4x4 _FluidWorldToUVW;            // world position → velocity-texture UVW [0,1]
+float4x4 _FluidVoxelToWorldVel;       // voxel/sec velocity → world/sec (linear part = rotation · cellSize)
+// apply_fluid_follow() is defined lower, after rnd01 (it needs the per-particle random helper).
+
+// Colliders (Plane / Sphere / Box). Resolved per-particle: SDF penetration push-out + velocity reflect.
+struct GpuCollider
+{
+    float4 center;    // xyz centre, w = shape (0 plane, 1 sphere, 2 box)
+    float4 normal;    // xyz plane normal, w = sphere radius
+    float4 extent;    // xyz box half-extents, w = unused (collision radius comes from _CollisionRadius × size)
+    float4 rot;       // box orientation (world quaternion)
+    float4 response;  // x bounce, y friction, z strength, w _
+    float4 jitter;    // per-particle ± fraction: x bounce, y friction, z strength, w unused
+};
+StructuredBuffer<GpuCollider> _Colliders;
+uint _ColliderCount;
+float _CollisionRadius;   // particle contact radius = size × this (system-wide)
+uint  _CollisionSleepOn;  // low-speed contact stabilization + persistent sleep
+float _CollisionSleepSpeed;
+float _CollisionWakeSpeed;
+uint  _CollisionSleepFrames;
+
+// NOTE: the force helper functions (qrot / safe_norm / force_falloff / apply_particle_forces) are
+// defined below the PRNG section — they depend on hash_u32 / rand_sphere / rand_range, and HLSL
+// has no forward declarations.
+
+// --- PRNG ---------------------------------------------------------------------------
+// PCG RXS-M-XS GPU hash adapted through the publisher-owned three-js-particles common.wgsl.
+// Algorithm: O'Neill's PCG family; GPU evaluation: Jarzynski & Olano, JCGT 9(3), 2020.
+float pcg(inout uint state)
+{
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    word = (word >> 22u) ^ word;
+    return float(word) / 4294967296.0;
+}
+float rand_range(inout uint s, float lo, float hi) { return lo + (hi - lo) * pcg(s); }
+
+uint hash_u32(uint x)
+{
+    x ^= x >> 16u; x *= 0x7feb352du;
+    x ^= x >> 15u; x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float3 rand_sphere(inout uint s)
+{
+    float u = pcg(s) * 2.0 - 1.0;
+    float theta = pcg(s) * 6.2831853;
+    float r = sqrt(max(0.0, 1.0 - u * u));
+    return float3(r * cos(theta), r * sin(theta), u);
+}
+float2 rand_disk(inout uint s)
+{
+    float r = sqrt(pcg(s));
+    float theta = pcg(s) * 6.2831853;
+    return float2(r * cos(theta), r * sin(theta));
+}
+
+// Sample a 256×1 curve LUT (R=min, G=max) with the internal prototype's explicit two-tap lerp.
+float2 sample_curve(Texture2D<float2> tex, float t)
+{
+    float x = saturate(t) * 255.0;
+    uint i0 = (uint)floor(x);
+    uint i1 = min(i0 + 1u, 255u);
+    float f = frac(x);
+    float2 a = tex.Load(int3(i0, 0, 0));
+    float2 b = tex.Load(int3(i1, 0, 0));
+    return lerp(a, b, f);
+}
+
+// Sample a 256×1 RGBA gradient LUT with the same explicit two-tap lerp.
+float4 sample_gradient(Texture2D<float4> tex, float t)
+{
+    float x = saturate(t) * 255.0;
+    uint i0 = (uint)floor(x);
+    uint i1 = min(i0 + 1u, 255u);
+    float f = frac(x);
+    float4 a = tex.Load(int3(i0, 0, 0));
+    float4 b = tex.Load(int3(i1, 0, 0));
+    return lerp(a, b, f);
+}
+
+float4 cloner_qmul(float4 a, float4 b)
+{
+    return float4(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz),
+                  a.w * b.w - dot(a.xyz, b.xyz));
+}
+
+float3 cloner_qrot(float4 q, float3 v)
+{
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+
+// Shape emit: local-space spawn position + unit direction, adapted from three-js-particles `shape.ts`.
+void shape_emit(inout uint s, out float3 pos, out float3 dir, out float3 svel)
+{
+    pos = float3(0.0, 0.0, 0.0);
+    dir = float3(0.0, 1.0, 0.0);
+    svel = float3(0.0, 0.0, 0.0);   // inherited source velocity (Mesh / Cloner shapes)
+
+    if (_ShapeKind == 0u)            // Sphere
+    {
+        dir = rand_sphere(s);
+        float r = (_ShapeShell == 1u) ? 1.0 : pow(pcg(s), 1.0 / 3.0);
+        pos = dir * _ShapeRadius * r;
+    }
+    else if (_ShapeKind == 1u)       // Hemisphere (upper half)
+    {
+        dir = rand_sphere(s); dir.y = abs(dir.y);
+        float r = (_ShapeShell == 1u) ? 1.0 : pow(pcg(s), 1.0 / 3.0);
+        pos = dir * _ShapeRadius * r;
+    }
+    else if (_ShapeKind == 2u)       // Cone — disk base, direction along the cone surface
+    {
+        float2 d = rand_disk(s);
+        float baseR = (_ShapeShell == 1u) ? 1.0 : sqrt(pcg(s));
+        pos = float3(d.x * _ShapeRadius * baseR, 0.0, d.y * _ShapeRadius * baseR);
+        float tilt = sin(_ShapeAngle), upc = cos(_ShapeAngle);
+        float2 xz = normalize(d + 1e-6);
+        dir = normalize(float3(xz.x * tilt, upc, xz.y * tilt));
+    }
+    else if (_ShapeKind == 3u)       // Box
+    {
+        pos = float3(rand_range(s, -1.0, 1.0), rand_range(s, -1.0, 1.0), rand_range(s, -1.0, 1.0)) * _ShapeBox;
+        dir = float3(0.0, 1.0, 0.0);
+    }
+    else if (_ShapeKind == 4u)       // Circle (XZ)
+    {
+        float2 d = rand_disk(s);
+        float r = (_ShapeShell == 1u) ? 1.0 : sqrt(pcg(s));
+        pos = float3(d.x * _ShapeRadius * r, 0.0, d.y * _ShapeRadius * r);
+        dir = normalize(float3(d.x, 0.0, d.y) + 1e-6);
+    }
+    else if (_ShapeKind == 5u)       // Plane (XZ surface, emits up)
+    {
+        pos = float3(rand_range(s, -0.5, 0.5) * _ShapePlane.x, 0.0, rand_range(s, -0.5, 0.5) * _ShapePlane.y);
+        dir = float3(0.0, 1.0, 0.0);
+    }
+    else if (_ShapeKind == 6u)       // Terrain (sin/cos displaced plane; dir = surface normal)
+    {
+        float x = rand_range(s, -0.5, 0.5) * _ShapePlane.x;
+        float z = rand_range(s, -0.5, 0.5) * _ShapePlane.y;
+        float f = _ShapeTerrainF, h = _ShapeTerrainH;
+        float y = sin(x * f) * cos(z * f) * h;
+        float dhx =  f * cos(x * f) * cos(z * f) * h;
+        float dhz = -f * sin(x * f) * sin(z * f) * h;
+        pos = float3(x, y, z);
+        dir = normalize(float3(-dhx, 1.0, -dhz));
+    }
+    else if (_ShapeKind == 7u)       // Torus (major = radius, minor = thickness)
+    {
+        float major = _ShapeRadius;
+        float minor = _ShapeTorusThickness;
+        float th = rand_range(s, 0.0, 6.2831853);    // angle around the ring
+        float phi = rand_range(s, 0.0, 6.2831853);   // angle around the tube
+        float rr = (_ShapeShell == 1u) ? minor : minor * sqrt(pcg(s));
+        float2 csM = float2(cos(th), sin(th));
+        float2 disk = float2(cos(phi), sin(phi)) * rr;          // (radial-in-tube, vertical)
+        float3 majorPt = float3(csM.x, 0.0, csM.y) * major;
+        float3 offset = float3(csM.x * disk.x, disk.y, csM.y * disk.x);
+        pos = majorPt + offset;
+        dir = normalize(offset + 1e-6);                          // spray outward from the tube
+    }
+    else if (_ShapeKind == 9u)       // Cylinder (Y axis)
+    {
+        float2 d = rand_disk(s);
+        float r = (_ShapeShell == 1u) ? 1.0 : sqrt(pcg(s));
+        float y = rand_range(s, -0.5, 0.5) * _ShapeHeight;
+        pos = float3(d.x * _ShapeRadius * r, y, d.y * _ShapeRadius * r);
+        dir = normalize(float3(d.x, 0.0, d.y) + float3(0.0, 1e-6, 0.0));
+    }
+    else if (_ShapeKind == 10u)      // Capsule (Y axis)
+    {
+        float halfSegment = max(0.0, _ShapeHeight * 0.5 - _ShapeRadius);
+        float3 o = rand_sphere(s);
+        float r = (_ShapeShell == 1u) ? 1.0 : pow(pcg(s), 1.0 / 3.0);
+        float y = rand_range(s, -halfSegment, halfSegment);
+        pos = float3(0.0, y, 0.0) + o * (_ShapeRadius * r);
+        dir = normalize(o + 1e-6);
+    }
+    else if (_ShapeKind == 11u)      // BrazeEmitter cone: base at -Y, tip at +Y
+    {
+        float h = max(_ShapeHeight, 1e-4);
+        float y01 = pcg(s);
+        float y = lerp(-h * 0.5, h * 0.5, y01);
+        float radiusAtY = _ShapeRadius * (1.0 - y01);
+        float2 d = rand_disk(s);
+        float r = (_ShapeShell == 1u) ? 1.0 : sqrt(pcg(s));
+        pos = float3(d.x * radiusAtY * r, y, d.y * radiusAtY * r);
+        dir = normalize(float3(d.x, 0.45, d.y) + 1e-6);
+    }
+    else if (_ShapeKind == 8u)        // Mesh — spawn from a random WORLD-space surface point (mask / whole mesh)
+    {
+        // Masked GPU emission: the sample count is the GPU-computed pass count; otherwise the full vertex/point count.
+        uint cnt = (_EmitUsePassIdx != 0u) ? _PassCountRO[0] : _EmitPointCount;
+        if (cnt > 0u)
+        {
+            uint idx = min((uint)(pcg(s) * (float)cnt), cnt - 1u);
+            if (_EmitUsePassIdx != 0u) idx = _EmitPassIdx[idx];   // masked: indirect through the pass-set into the full vert buffer
+            if (_EmitInputLocal != 0u)
+            {
+                float3 lp = _EmitPoints[idx];
+                float3 wp = mul(_EmitLocalToWorld, float4(lp, 1.0)).xyz;
+                float3 wn = mul((float3x3)_EmitNormalLocalToWorld, _EmitNormals[idx]);
+                float nl = length(wn);
+                pos = wp;
+                dir = nl > 1e-5 ? wn / nl : float3(0.0, 1.0, 0.0);
+                svel = (_EmitHasPrevLocal != 0u)
+                    ? (wp - mul(_EmitPrevLocalToWorld, float4(lp, 1.0)).xyz) * _EmitLocalInvDt
+                    : float3(0.0, 0.0, 0.0);
+            }
+            else
+            {
+                pos = _EmitPoints[idx];     // already WORLD space → Emit skips _EmitToWorld for this shape
+                dir = _EmitNormals[idx];    // emit along the surface normal (world)
+                svel = _EmitVelocities[idx];// world-space surface velocity to inherit
+            }
+            svel += dir * _EmitExtraNormalVelocity;
+        }
+        else dir = float3(0.0, 1.0, 0.0);
+    }
+    else if (_ShapeKind == 12u)       // Cloner — sample final WORLD-space clone transforms directly
+    {
+        if (_EmitClonerCount > 0u)
+        {
+            uint idx = min((uint)(pcg(s) * (float)_EmitClonerCount), _EmitClonerCount - 1u);
+            pos = _EmitClonerBasePosition[idx].xyz + _EmitClonerPositionOffset[idx].xyz;
+
+            float4 rotation = cloner_qmul(
+                _EmitClonerRotationOffset[idx], _EmitClonerBaseRotation[idx]);
+            float rotationLength = length(rotation);
+            rotation = rotationLength > 1e-5
+                ? rotation / rotationLength
+                : float4(0.0, 0.0, 0.0, 1.0);
+            dir = cloner_qrot(rotation, float3(0.0, 1.0, 0.0));
+            float directionLength = length(dir);
+            dir = directionLength > 1e-5 ? dir / directionLength : float3(0.0, 1.0, 0.0);
+
+            svel = (_EmitClonerHasPrevious != 0u)
+                ? (pos - _EmitClonerPreviousPosition[idx].xyz) * _EmitClonerInvDt
+                : float3(0.0, 0.0, 0.0);
+        }
+    }
+}
+
+// --- Forces (defined here so the PRNG helpers above are in scope) --------------------
+float3 qrot(float4 q, float3 v) { return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
+float3 safe_norm(float3 v, float3 fb) { float l = length(v); return l > 1e-5 ? v / l : fb; }
+
+float3 axis_planar_fallback(float3 axis, inout uint seed)
+{
+    float3 r = rand_sphere(seed);
+    r -= axis * dot(r, axis);
+    float3 basis = abs(axis.y) < 0.99
+        ? safe_norm(cross(axis, float3(0.0, 1.0, 0.0)), float3(1.0, 0.0, 0.0))
+        : safe_norm(cross(axis, float3(1.0, 0.0, 0.0)), float3(0.0, 0.0, 1.0));
+    return safe_norm(r, basis);
+}
+
+float3 emitter_motion_velocity(float3 pos, float3 fallbackDir)
+{
+    float3 v = float3(0.0, 0.0, 0.0);
+    if (_EmitterMotionEnable != 0u)
+    {
+        v = _EmitterMotionVelocity;
+        if (abs(_EmitterMotionRadial) > 1e-5)
+            v += safe_norm(pos - _EmitterMotionCenter, fallbackDir) * _EmitterMotionRadial;
+    }
+    return v;
+}
+
+// C4D-style region falloff: 1 at the centre, ramps to 0 at the region edge via the per-force curve.
+float force_falloff(float3 pos, float3 center, GpuForce f)
+{
+    float shape = f.misc.x;
+    float result = 1.0;                          // infinite — full strength everywhere
+    if (shape >= 0.5)
+    {
+        float3 d = pos - center;
+        float t = 0.0;
+        if (shape < 1.5)                         // sphere
+        {
+            t = length(d) / max(f.boxHalf.w, 1e-4);
+        }
+        else                                     // oriented box
+        {
+            float3 ld = qrot(float4(-f.rot.xyz, f.rot.w), d);
+            float3 q = abs(ld) / max(f.boxHalf.xyz, 1e-4);
+            t = max(max(q.x, q.y), q.z);
+        }
+        if (t > 1.0)
+        {
+            result = 0.0;
+        }
+        else
+        {
+            float x = saturate(t) * 255.0;
+            uint i0 = (uint)floor(x);
+            uint i1 = min(i0 + 1u, 255u);
+            uint row = (uint)f.misc.y * 256u;
+            result = lerp(_ForceFalloff[row + i0], _ForceFalloff[row + i1], frac(x));
+        }
+    }
+    return result;
+}
+
+// Turbulence noise — adapted from the publisher-owned sparse-flip force library (hash01 + turbulenceField).
+float hash01u(uint x)
+{
+    x = ((x >> 16u) ^ x) * 73244475u;
+    x = ((x >> 16u) ^ x) * 73244475u;
+    x = (x >> 16u) ^ x;
+    return float(x & 65535u) / 65535.0;
+}
+
+// Independent per-particle random in [0,1] from a stable seed + salt. The over-life modules use this
+// (instead of one shared advancing PRNG) so toggling one module never shifts another's randomness, and
+// the On-Death chance roll stays the same regardless of which modules are enabled.
+float rnd01(uint seed, uint salt) { return hash01u(seed * 747796405u + salt + 1u); }
+
+// Fluid-follow: advect the particle along the connected container's live velocity field. Defined here (not by
+// its uniform block above) because it uses rnd01 for the per-particle jitter. See the uniform block for details.
+void apply_fluid_follow(inout float3 vel, float3 pos, uint ps)
+{
+    if (_FluidFollowEnable == 0u) return;
+    float3 uvw = mul(_FluidWorldToUVW, float4(pos, 1.0)).xyz;
+    if (any(uvw < 0.0) || any(uvw > 1.0)) return;            // particle is outside the fluid grid
+    float occ = _FluidOcc.SampleLevel(sampler_LinearClamp, uvw, 0).r;
+    if (occ <= 0.0) return;                                  // no fluid here → keep the particle's own motion
+    float3 velVox = _FluidVel.SampleLevel(sampler_LinearClamp, uvw, 0).xyz;
+
+    // Per-particle jitter from the particle's stable seed (constant over its life, so motion stays coherent,
+    // not flickery). Follow loosens some particles (one-sided: base = tightest); Boost spreads ± so a few
+    // embers fling far while others lag — kills the "every particle moves identically" look.
+    float kJit    = 1.0 - _FluidFollowRand * rnd01(ps, 0x61u);            // [1-rand, 1]
+    float gainJit = 1.0 + _FluidFollowGainRand * (rnd01(ps, 0x62u) * 2.0 - 1.0);  // [1-rand, 1+rand]
+
+    // Gain exaggerates the target: the particle chases a faster-than-fluid velocity, so a gentle flame can
+    // still fling its particles far (chimney effect). Direction is preserved — only the magnitude is scaled.
+    float3 velWorld = mul((float3x3)_FluidVoxelToWorldVel, velVox) * (_FluidFollowGain * max(0.0, gainJit));
+    vel = lerp(vel, velWorld, saturate(_FluidFollowK * kJit * occ));
+}
+
+// Smooth pseudo-random 3D vector field — cheap "curl-noise-ish" turbulence (sum of orthogonal sinusoids).
+float3 turbulenceField(float3 pos, float t, float scale)
+{
+    float3 p = pos * scale;
+    float3 s1 = float3(
+        sin(p.y * 2.1 + t * 1.3) + cos(p.z * 1.7 - t * 0.8),
+        sin(p.z * 2.3 + t * 1.1) + cos(p.x * 1.9 - t * 1.0),
+        sin(p.x * 2.7 + t * 0.9) + cos(p.y * 1.3 - t * 1.2));
+    float3 s2 = float3(
+        sin(p.z * 5.3 - t * 2.1) * 0.5,
+        sin(p.x * 4.9 - t * 1.7) * 0.5,
+        sin(p.y * 5.7 - t * 2.3) * 0.5);
+    return s1 + s2;
+}
+
+// Curl of the field → DIVERGENCE-FREE flow: particles swirl into turbulent shapes with no net
+// drift (the earlier sparse-flip field relied on FLIP pressure projection to remove that drift; free
+// particles have none, so we take the curl here instead). Amplitude normalized to be wave-size-independent.
+float3 curl_turbulence(float3 pos, float t, float freq)
+{
+    const float e = 0.05;
+    float3 dx = turbulenceField(pos + float3(e, 0, 0), t, freq) - turbulenceField(pos - float3(e, 0, 0), t, freq);
+    float3 dy = turbulenceField(pos + float3(0, e, 0), t, freq) - turbulenceField(pos - float3(0, e, 0), t, freq);
+    float3 dz = turbulenceField(pos + float3(0, 0, e), t, freq) - turbulenceField(pos - float3(0, 0, e), t, freq);
+    float inv = 1.0 / (2.0 * e);
+    float3 c = float3(dy.z - dz.y, dz.x - dx.z, dx.y - dy.x) * inv;
+    return c / max(freq, 0.05);
+}
+
+float surface_wisp_scalar(float3 pos, float t, float freq)
+{
+    float3 p = pos * freq;
+    float n = sin(dot(p, float3(1.73, 2.17, -0.83)) + t * 1.11) * 0.55;
+    n += sin(dot(p, float3(-2.31, 0.91, 1.67)) - t * 1.37) * 0.30;
+    n += sin(dot(p, float3(3.07, -1.49, 2.53)) + t * 2.03) * 0.15;
+    return n;
+}
+
+
+void apply_turbulence_force(inout float3 vel, float3 pos, uint pseed, uint forceIndex, GpuForce f)
+{
+    uint fseed = hash_u32(pseed ^ hash_u32(forceIndex + 0x9e3779b9u));
+    float centerJit = max(f.jitter.x, 0.0);
+    float strJit = saturate(f.jitter.z);
+    float3 center = f.position.xyz + rand_sphere(fseed) * centerJit;
+    float fo = force_falloff(pos, center, f);
+    if (fo <= 0.0) return;
+    float strength = f.direction.w * (1.0 + rand_range(fseed, -strJit, strJit)) * fo;
+
+    float tDetail = saturate(f.extra.x);
+    float tScale = f.extra.y;
+    float scaleRand = saturate(f.extra.z);
+    // Per-particle wave size (exp2 -> symmetric in octaves) so the swirl sizes aren't uniform.
+    float freq = (2.0 / max(tScale, 0.05)) * exp2((hash01u(pseed * 374761393u + 13u) * 2.0 - 1.0) * scaleRand);
+    // Drive the field with wall-clock time so it keeps evolving. A STATIC curl field (t = 0) has fixed
+    // stagnation points; aligning constant-speed particles to it funnels them into those sinks, so over
+    // ~20-30s every particle pools at one spot. A time-varying field has no persistent attractor — the
+    // intended "boiling/drifting" turbulence (the earlier prototype field was time-varying; the first port froze it).
+    float3 nn = curl_turbulence(pos, _TurbTime, freq);
+    nn += curl_turbulence(pos, _TurbTime, freq * 3.5) * tDetail;    // finer octave — full-weight so Detail reads
+    nn = nn / (1.0 + tDetail);
+
+    // Turbulence is a shape/conformance field, not a push. It bends existing velocity toward the curl field while
+    // preserving speed, so it cannot inject linear momentum or overshoot like wind.
+    float3 flow = safe_norm(nn, float3(0.0, 1.0, 0.0));
+    if (strength < 0.0) flow = -flow;
+    float spd = length(vel);
+    if (spd > 1e-5)
+    {
+        float3 cur = vel / spd;
+        float response = min(1.0 - exp(-abs(strength) * _Dt), 0.35);
+        vel = safe_norm(lerp(cur, flow, response), cur) * spd;
+    }
+}
+
+// Spline Flow path (sampled positions + unit tangents in world space; one per system, like the mesh grid).
+StructuredBuffer<float3> _SplinePos;
+StructuredBuffer<float3> _SplineTan;
+uint _SplineCount;
+
+// Capture a particle into the nearest point on the spline path and stream it along the tangent. Strength
+// (f.direction.w) = flow speed; Capture (extra.x) = pull-to-curve; captureRadius (extra.y) = tube reach;
+// Swirl (extra.z) = twist around the curve; reverse (extra.w); Stick (misc.z) = tube confinement.
+void apply_spline_flow_force(inout float3 vel, float3 pos, uint pseed, uint forceIndex, GpuForce f)
+{
+    if (_SplineCount == 0u) return;
+
+    float captureRadius = max(f.extra.y, 1e-3);
+
+    // Region falloff still applies, so Shape != Infinite can localize the flow to part of the path.
+    uint fseed = hash_u32(pseed ^ hash_u32(forceIndex + 0x9e3779b9u));
+    float3 center = f.position.xyz + rand_sphere(fseed) * max(f.jitter.x, 0.0);
+    float fo = force_falloff(pos, center, f);
+    if (fo <= 0.0) return;
+
+    // Nearest sample on the path (vertex-nearest over the bounded sample set).
+    float best = captureRadius * captureRadius;
+    int bi = -1;
+    uint cnt = min(_SplineCount, 1024u);
+    for (uint j = 0u; j < cnt; j++)
+    {
+        float3 d = _SplinePos[j] - pos;
+        float dd = dot(d, d);
+        if (dd < best) { best = dd; bi = (int)j; }
+    }
+    if (bi < 0) return;
+
+    float3 P = _SplinePos[bi];
+    float3 T = safe_norm(_SplineTan[bi], float3(0, 1, 0));
+    if (f.extra.w > 0.5) T = -T;
+
+    float3 toCurve = P - pos;
+    float dist = length(toCurve);
+    float3 nrm = dist > 1e-5 ? toCurve / dist : float3(0, 0, 0);
+    float fall = saturate(1.0 - dist / captureRadius) * fo;
+
+    float capture   = f.extra.x;
+    float flowSpeed = f.direction.w;
+    float swirl     = f.extra.z;
+    float stick     = saturate(f.misc.z);
+
+    vel += nrm * capture * fall * _Dt;        // pull onto the curve
+    vel += T * flowSpeed * fall * _Dt;        // stream along the tangent
+    if (abs(swirl) > 1e-4)                     // corkscrew around the curve axis
+    {
+        float3 swirlAxis = safe_norm(cross(T, nrm), float3(1, 0, 0));
+        vel += swirlAxis * swirl * fall * _Dt;
+    }
+    if (stick > 0.0)                           // confine: damp velocity escaping the tube
+    {
+        float3 outward = -nrm;
+        float vOut = dot(vel, outward);
+        if (vOut > 0.0) vel -= outward * vOut * stick;
+    }
+}
+
+// Surface Flow warm-start: last frame's contact triangle per particle slot (+1; 0 = none). A glued particle
+// re-tests just this one triangle and skips the cell-ring search entirely while it stays over the same face —
+// the common case, since the constraint keeps particles on the surface. Stale hints self-validate by distance.
+RWStructuredBuffer<uint> _FlowHint;
+
+// Surface Flow (type 5) — POSITION-BASED surface flow. Runs AFTER integration + collisions, not in the
+// velocity force stack: each frame the particle is projected back into a thin shell around the mesh, so no
+// force, collision, or integration step can carry it off — at Adhesion 1 escape is impossible by construction
+// (the projection is the last thing that touches position). Velocity is rebuilt in the tangent plane from a
+// flow field composed ON the surface:
+//   • Swirl — a stream function ψ (scalar noise on the shell): v = n × ∇ψ is divergence-free ON the skin, so
+//     particles circulate in true on-surface eddies around the ψ extrema and race along its iso-lines as
+//     filaments. (The old 3D-curl-projected-to-tangent approach lost this structure in the projection.)
+//   • Broad current — the projected 3D curl, kept as the laminar base; the Swirl knob blends between them.
+//   • Drift — a constant world-direction current pressed onto the skin (energy licking upward a statue).
+void apply_surface_flow_constraint(uint i, inout float3 pos, inout float3 vel, uint pseed, uint forceIndex, GpuForce f)
+{
+    uint fseed = hash_u32(pseed ^ hash_u32(forceIndex + 0x9e3779b9u));
+    float3 center = f.position.xyz + rand_sphere(fseed) * max(f.jitter.x, 0.0);
+    float fo = force_falloff(pos, center, f);
+    if (fo <= 0.0) return;
+
+    // Query reach: the shell plus one frame of travel. A particle that ended last frame in the shell can be at
+    // most |vel|·dt beyond it now, so a captured particle can never outrun the query.
+    float offset = f.extra.z;
+    float band = max(f.misc.w, 0.01);
+    float reach = abs(offset) + band + length(vel) * _Dt * 2.0 + _GridCellSize;
+
+    // Warm start: while the particle stays over the same face (interior barycentric, within reach) the cached
+    // triangle IS the contact — one triangle test instead of a cell-ring search. Sliding off the face (bary
+    // pinned to an edge) or straying past reach falls back to the full query and re-caches.
+    int ftri = -1;
+    float3 fbary = float3(1.0, 0.0, 0.0), fsp = pos, fsn = float3(0.0, 1.0, 0.0);
+    bool hit = false;
+    uint hint = _FlowHint[i];
+    if (hint != 0u && hint <= _GridTriCount)
+    {
+        float3 bc, cpp, nn;
+        float dd = braze_tri_closest(hint - 1u, pos, bc, cpp, nn);
+        if (dd < reach * reach && min(bc.x, min(bc.y, bc.z)) > 0.02)
+        {
+            ftri = (int)(hint - 1u); fbary = bc; fsp = cpp;
+            float l = length(nn); fsn = l > 1e-8 ? nn / l : float3(0.0, 1.0, 0.0);
+            hit = true;
+        }
+    }
+    if (!hit) hit = braze_grid_query(pos, reach, ftri, fbary, fsp, fsn);
+    _FlowHint[i] = hit ? (uint)(ftri + 1) : 0u;
+    if (!hit) return;
+
+    // Tangent basis at the contact.
+    float3 t0 = abs(fsn.y) < 0.95
+        ? safe_norm(cross(fsn, float3(0.0, 1.0, 0.0)), float3(1.0, 0.0, 0.0))
+        : safe_norm(cross(fsn, float3(1.0, 0.0, 0.0)), float3(0.0, 0.0, 1.0));
+    float3 t1 = safe_norm(cross(fsn, t0), float3(0.0, 0.0, 1.0));
+
+    float strJit = saturate(f.jitter.z);
+    float speed = abs(f.direction.w) * (1.0 + rand_range(fseed, -strJit, strJit)) * fo;
+    float tDetail = saturate(f.extra.x);
+    float freq = 2.0 / max(f.extra.y, 0.05);
+    float3 sp = fsp + fsn * offset;
+
+    // Both field families are gated on their blend weight (uniform per force, so no thread divergence): full
+    // Swirl skips the curl entirely, full current skips the stream function, Detail 0 skips the fine octaves.
+    float swirlW = saturate(f.misc.z);
+
+    // Stream-function eddies: tangential gradient of ψ, rotated 90° in the plane (= n × ∇ψ). Two octaves,
+    // the fine one weighted by Detail.
+    float3 swirlDir = float3(0.0, 0.0, 0.0);
+    if (swirlW > 1e-3)
+    {
+        float e0 = clamp(0.15 / max(freq, 0.05), 0.01, 0.25);
+        float g0 = surface_wisp_scalar(sp + t0 * e0, _TurbTime * 0.9, freq) - surface_wisp_scalar(sp - t0 * e0, _TurbTime * 0.9, freq);
+        float g1 = surface_wisp_scalar(sp + t1 * e0, _TurbTime * 0.9, freq) - surface_wisp_scalar(sp - t1 * e0, _TurbTime * 0.9, freq);
+        float2 grad = float2(g0, g1) / (2.0 * e0);
+        if (tDetail > 0.01)
+        {
+            float e1 = e0 * 0.35;
+            float h0 = surface_wisp_scalar(sp + t0 * e1, _TurbTime * 1.7, freq * 3.1) - surface_wisp_scalar(sp - t0 * e1, _TurbTime * 1.7, freq * 3.1);
+            float h1 = surface_wisp_scalar(sp + t1 * e1, _TurbTime * 1.7, freq * 3.1) - surface_wisp_scalar(sp - t1 * e1, _TurbTime * 1.7, freq * 3.1);
+            grad += float2(h0, h1) / (2.0 * e1) * (0.6 * tDetail);
+        }
+        swirlDir = t0 * (-grad.y) + t1 * grad.x;
+    }
+
+    // Broad laminar current: 3D curl projected onto the tangent plane.
+    float3 curlDir = float3(0.0, 0.0, 0.0);
+    if (swirlW < 0.999)
+    {
+        float3 curl = curl_turbulence(sp, _TurbTime * 0.72, freq);
+        if (tDetail > 0.01) curl += curl_turbulence(sp, _TurbTime * 1.31, freq * 4.7) * (0.55 * tDetail);
+        curlDir = curl - fsn * dot(curl, fsn);
+    }
+
+    // Filament emphasis: the swirl flow runs along ψ's iso-lines; near the ψ = 0 lines particles speed up, so
+    // the eddies read as racing strands instead of a uniform crawl.
+    float psi = surface_wisp_scalar(sp, _TurbTime * 0.9, freq);
+    float strand = 1.0 - smoothstep(0.02, 0.5, abs(psi));
+
+    float3 fallback = safe_norm(cross(fsn, float3(0.0, 1.0, 0.0)), float3(1.0, 0.0, 0.0));
+    float3 flowDir = safe_norm(safe_norm(curlDir, fallback) * (1.0 - swirlW)
+                             + safe_norm(swirlDir, fallback) * swirlW, fallback);
+    if (f.direction.w < 0.0) flowDir = -flowDir;
+
+    // Drift: world current pressed onto the skin (direction.xyz + speed in jitter.y, packed by BrazeSurfaceFlow).
+    float3 driftT = f.direction.xyz * f.jitter.y;
+    driftT -= fsn * dot(driftT, fsn);
+
+    // Velocity: conform the tangential part to the flow target, remove the normal part (Adhesion), so trails
+    // and stretched billboards match the constrained motion instead of showing the cancelled push.
+    float vn = dot(vel, fsn);
+    float3 vtan = vel - fsn * vn;
+    float align = saturate(f.jitter.w);
+    float conform = 1.0 - exp(-lerp(3.0, 40.0, align) * _Dt);
+    float3 target = flowDir * (speed * lerp(0.6, 1.25, strand)) + driftT * fo;
+    vtan = lerp(vtan, target, conform);
+    float adhesion = saturate(f.extra.w) * fo;
+    vel = vtan + fsn * (vn * (1.0 - adhesion));
+
+    // THE constraint: project the particle back into the shell (Offset ± half the Thickness). Inside the shell
+    // it keeps its height — the skin keeps volume — beyond it the excess is removed, hard at Adhesion 1.
+    float sd = dot(pos - fsp, fsn) - offset;
+    float freeH = band * 0.5;
+    float excess = sign(sd) * max(abs(sd) - freeH, 0.0);
+    pos -= fsn * (excess * adhesion);
+}
+
+// Full effector model adapted from three-js-particles: per-particle jitter (centre/direction/strength)
+// and vortex Swirl / Inward / Orbit modes via axis-planar velocity targeting.
+void apply_particle_forces(inout float3 vel, float3 pos, uint pseed)
+{
+    uint n = min(_ForceCount, 32u);
+    // Pass 1: forces that create, target, or damp speed.
+    for (uint i = 0u; i < n; i++)
+    {
+        GpuForce f = _Forces[i];
+        uint type = (uint)f.position.w;
+        if (type == 4u || type == 5u || type == 6u) continue;
+
+        uint fseed = hash_u32(pseed ^ hash_u32(i + 0x9e3779b9u));
+        float centerJit = max(f.jitter.x, 0.0);
+        float dirJit = saturate(f.jitter.y);
+        float strJit = saturate(f.jitter.z);
+        float3 center = f.position.xyz + rand_sphere(fseed) * centerJit;
+        float varied = f.direction.w * (1.0 + rand_range(fseed, -strJit, strJit));
+        float fo = force_falloff(pos, center, f);
+        if (fo <= 0.0) continue;
+        float strength = varied * fo;
+
+        if (type == 0u)              // Directional / wind
+        {
+            float3 dir = safe_norm(f.direction.xyz + rand_sphere(fseed) * dirJit, float3(1, 0, 0));
+            vel += dir * strength * _Dt;
+        }
+        else if (type == 1u)         // Radial — accelerate toward a target outward/inward speed, then coast
+        {
+            // strength is signed (+ = push out, - = pull in) and falloff-scaled. We approach that target
+            // radial speed at a bounded rate, and never brake a particle already moving faster than it,
+            // so the blast/attract is bounded and doesn't corrupt motion from other forces.
+            // At the exact centre the radial direction is undefined → fall back to a PER-PARTICLE random
+            // direction so particles burst spherically instead of all firing the same way (a cone).
+            float3 outward = safe_norm(pos - center, rand_sphere(fseed));
+            float radialVel = dot(vel, outward);
+            float maxStep = abs(strength) * 4.0 * _Dt;
+            float delta = strength - radialVel;
+            vel += outward * ((strength >= 0.0) ? clamp(delta, 0.0, maxStep) : clamp(delta, -maxStep, 0.0));
+        }
+        else if (type == 2u)         // Vortex — swirl / inward / orbit
+        {
+            float3 axis = safe_norm(f.direction.xyz + rand_sphere(fseed) * dirJit, float3(0, 1, 0));
+            float3 radial = pos - center;
+            float3 planar = radial - axis * dot(radial, axis);
+            float planarLen = length(planar);
+            float3 fallbackOutward = axis_planar_fallback(axis, fseed);
+            float3 outward = safe_norm(planar, fallbackOutward);
+            float3 tangent = safe_norm(cross(axis, outward), safe_norm(cross(axis, fallbackOutward), float3(1, 0, 0)));
+            float mode = f.misc.w;
+            if (mode < 0.5)                          // Swirl — rotate velocity around the axis (stable orbit)
+            {
+                // Speed-preserving rotation of the velocity about the swirl axis (Rodrigues); Strength is the
+                // angular rate (rad/sec). Axial drift is untouched and the in-plane velocity circulates, so a
+                // particle's radial escape curves back into a bounded orbit instead of spiralling out. This is
+                // the rotational twin of turbulence's speed-preserving conformance — pure rotation, nothing else.
+                float phi = strength * _Dt;
+                float si, co; sincos(phi, si, co);
+                vel = vel * co + cross(axis, vel) * si + axis * dot(axis, vel) * (1.0 - co);
+            }
+            else                                     // Inward / Orbit — spin up tangentially, then pull to a radius
+            {
+                float fieldRadius = (f.misc.x > 1.5) ? min(min(f.boxHalf.x, f.boxHalf.y), f.boxHalf.z) : max(f.boxHalf.w, 0.0);
+                float spin = saturate(abs(strength) * _Dt);
+                float radialVel = dot(vel, outward);
+                float tangVel = dot(vel, tangent);
+                float3 nextVel = vel + tangent * ((strength - tangVel) * spin);   // target tangential speed = strength
+                float hold = saturate(max(f.misc.z, 0.0) * _Dt);
+                if (mode < 1.5)                      // inward — suck toward the axis
+                {
+                    float targetRadial = -planarLen * max(abs(strength), 1.0);
+                    nextVel += outward * ((targetRadial - radialVel) * hold);
+                }
+                else                                 // orbit — hold at a target radius
+                {
+                    // Orbit Radius is exactly the value you set. Only clamp it INSIDE a bounded region (Sphere/Box),
+                    // where the falloff is ~0 past the edge so an orbit out there would just let particles escape.
+                    // Infinite has no edge — clamping it to the (here meaningless) region radius was capping it.
+                    float targetRadius = max(f.jitter.w, 0.0);
+                    if (f.misc.x > 0.5)
+                        targetRadius = min(targetRadius, max(fieldRadius * 0.95, 0.0001));
+                    float targetRadial = -(planarLen - targetRadius) * max(abs(strength), 1.0);
+                    nextVel += outward * ((targetRadial - radialVel) * hold);
+                    float axialDamp = saturate(max(f.misc.z, 0.0) * max(abs(strength), 1.0) * 2.0 * _Dt);
+                    nextVel -= axis * (dot(nextVel, axis) * axialDamp); // damp emitter/fluid drift without erasing other forces
+                }
+                vel = nextVel;
+            }
+
+            // Axial control (all modes): ease the along-axis velocity toward Lift. This is the column-height knob —
+            // Axial Damp 0 leaves the vertical drift free (a tall column); higher Damp holds it toward Lift, so
+            // Lift = 0 flattens the column to a disc and Lift > 0 gives a controlled updraft (height ~ Lift × life).
+            float vAxDamp = saturate(f.extra.y);
+            if (vAxDamp > 0.0 || abs(f.extra.x) > 1e-6)   // Lift OR Axial Damp active (else free column)
+            {
+                // Ease the along-axis speed toward Lift. A built-in base rate makes Lift drive on its own; Axial
+                // Damp firms it up (and at Lift 0 settles a free column). Frame-rate independent. Height ~ Lift × life.
+                float liftVar = saturate(f.extra.z);
+                float lift = f.extra.x * (1.0 + rand_range(fseed, -liftVar, liftVar));   // per-particle ± (stable)
+                float axialVel = dot(vel, axis);
+                float k = 1.0 - exp(-(2.0 + vAxDamp * 10.0) * _Dt);
+                vel += axis * ((lift - axialVel) * k);
+            }
+        }
+        else if (type == 3u)         // Drag (dampen velocity inside the region)
+        {
+            vel *= saturate(1.0 - strength * _Dt);
+        }
+    }
+
+    // Pass 2: turbulence bends the final velocity direction toward curl flow without changing speed.
+    for (uint ti = 0u; ti < n; ti++)
+    {
+        GpuForce f = _Forces[ti];
+        if ((uint)f.position.w == 4u) apply_turbulence_force(vel, pos, pseed, ti, f);
+    }
+
+    // (Surface Flow — type 5 — is NOT part of the velocity stack: it runs as a position-based constraint in
+    // Simulate, after integration + collisions, so nothing can undo its projection. See
+    // apply_surface_flow_constraint.)
+
+    // Pass 3: Spline Flow captures particles into a curve and streams them along it.
+    for (uint pi = 0u; pi < n; pi++)
+    {
+        GpuForce f = _Forces[pi];
+        if ((uint)f.position.w == 6u) apply_spline_flow_force(vel, pos, pseed, pi, f);
+    }
+}
+
+// --- Collisions (Plane / Sphere / Box) -----------------------------------------------
+// Each collider returns a contact as float4(normal.xyz, penetration). penetration > 0 = overlapping.
+// Adapted from the publisher-owned three-js-particles collide_plane/sphere/box implementation.
+float4 collide_plane(float3 pos, float3 vel, GpuCollider c, float pr)
+{
+    float4 q = c.rot;
+    float3 d = pos - c.center.xyz;
+    float3 n = safe_norm(c.normal.xyz, float3(0, 1, 0));
+    float sd = dot(d, n);                       // signed distance to the plane (along the normal)
+    float4 r = float4(n, -1.0);                 // default: no contact
+
+    // Finite quad: reject if the contact point projects outside the local X/Z half-extents.
+    float lx = dot(d, qrot(q, float3(1, 0, 0)));
+    float lz = dot(d, qrot(q, float3(0, 0, 1)));
+
+    // Contact band: only collide near the surface so the plane isn't a solid block below it.
+    // `approach` widens the band by this frame's inbound travel → fast particles don't tunnel.
+    float approach = max(0.0, -dot(vel, n)) * _Dt;
+    bool insideQuad = abs(lx) <= c.extent.x + pr && abs(lz) <= c.extent.z + pr;
+    bool insideBand = sd >= -(pr + approach) && sd <= pr;
+    if (insideQuad && insideBand) r.w = pr - sd;
+    return r;
+}
+
+float4 collide_sphere(float3 pos, GpuCollider c, float pr)
+{
+    float3 d = pos - c.center.xyz;
+    float dist = length(d);
+    float3 n = safe_norm(d, float3(0, 1, 0));
+    return float4(n, (c.normal.w + pr) - dist);
+}
+
+float4 collide_box(float3 pos, GpuCollider c, float pr)
+{
+    float4 q = c.rot;
+    float3 ld = qrot(float4(-q.xyz, q.w), pos - c.center.xyz);   // into box-local space
+    float3 hs = max(c.extent.xyz, 1e-4) + pr;
+    float3 qd = abs(ld) - hs;
+    float4 r = float4(0, 1, 0, -1.0);                            // default: no contact (single return)
+    if (max(max(qd.x, qd.y), qd.z) > 0.0)                        // outside the (inflated) box
+    {
+        float3 outside = max(qd, 0.0);
+        float od = length(outside);
+        if (od <= pr)                                            // close enough to the surface to contact
+        {
+            float3 worldOut = qrot(q, outside * sign(ld));
+            r = float4(safe_norm(worldOut, float3(0, 1, 0)), pr - od);
+        }
+    }
+    else
+    {
+        // Inside — eject through the nearest face.
+        float px = hs.x - abs(ld.x), py = hs.y - abs(ld.y), pz = hs.z - abs(ld.z);
+        if (px <= py && px <= pz) r = float4(qrot(q, float3(sign(ld.x), 0, 0)), px);
+        else if (py <= pz)        r = float4(qrot(q, float3(0, sign(ld.y), 0)), py);
+        else                      r = float4(qrot(q, float3(0, 0, sign(ld.z))), pz);
+    }
+    return r;
+}
+
+// On-Collision event at a hit point: fire a capped CPU sample (e.g. seed a spread) and/or spawn particles
+// there. Independent bits; fires once per particle per frame via the `fired` guard (first contact).
+void emit_on_collision(float3 hitPoint, uint pseed, inout bool fired)
+{
+    if (fired) return;
+    fired = true;
+    if ((_OnCollisionOp & 2u) != 0u)        // fire Unity event (capped world-position sample)
+    {
+        uint e; InterlockedAdd(_CollisionEventCount[0], 1u, e);
+        if (e < _EventCapacity) _CollisionEventPos[e] = float4(hitPoint, 1.0);
+    }
+    if ((_OnCollisionOp & 1u) != 0u)        // spawn particles at the hit (into the shared request buffer)
+    {
+        float flags = asfloat(_OnCollisionInherit);
+        for (int kk = 0; kk < _OnCollisionCount; kk++)
+        {
+            uint idx; InterlockedAdd(_ReqCount[0], 1u, idx);
+            if (idx >= _ReqCapacity) break;
+            uint jseed = hash_u32(pseed ^ hash_u32((uint)kk * 0x9e3779b9u + 7u));
+            float3 off = rand_sphere(jseed) * (_OnCollisionPosJitter * pcg(jseed));
+            SpawnRequest rq;
+            rq.position = float4(hitPoint + off, flags);
+            rq.velocity = float4(0.0, 0.0, 0.0, 0.0);   // children use their own Start Speed
+            rq.color    = _StartColor;
+            _Requests[idx] = rq;
+        }
+    }
+}
+
+// Resolve every collider against the (already-integrated) position: push out of penetration and
+// reflect the inbound normal velocity (bounce) while damping the tangential part (friction).
+void apply_particle_collisions(inout float3 pos, inout float3 vel, float3 drivingDelta, float size, uint pseed,
+                               inout uint sleepFrames)
+{
+    uint n = min(_ColliderCount, 16u);
+    // Roll the On-Collision event once per particle (independent hash); fire on the FIRST contact this frame.
+    bool emitColl = (_OnCollisionOp != 0u) && (rnd01(pseed, 0x53u) < _OnCollisionChance);
+    bool firedColl = false;
+    bool hadContact = false;
+    bool externallyDriven = false;
+    float wakeTangentialSpeed = 0.0;
+    for (uint i = 0u; i < n; i++)
+    {
+        GpuCollider c = _Colliders[i];
+
+        // Per-particle, per-collider random traits (stable across the particle's life). Multiplicative
+        // ± jitter, matching the force effectors' variation convention.
+        uint cseed = hash_u32(pseed ^ hash_u32(i + 0x9e3779b9u));
+        float jb = c.jitter.x, jf = c.jitter.y, js = c.jitter.z;
+        float pr = size * _CollisionRadius;     // contact radius = size × the system's collision scale
+        uint shape = (uint)c.center.w;
+
+        float4 hit = (shape == 0u) ? collide_plane(pos, vel, c, pr)
+                   : (shape == 1u) ? collide_sphere(pos, c, pr)
+                                   : collide_box(pos, c, pr);
+        float penetration = hit.w;
+        if (penetration <= 0.0) continue;
+        hadContact = true;
+
+        if (emitColl) emit_on_collision(pos, pseed, firedColl);   // fire / spawn at the hit (first contact)
+
+        float3 nrm = hit.xyz;
+        float bounce = saturate(c.response.x * (1.0 + rand_range(cseed, -jb, jb)));
+        float friction = saturate(c.response.y * (1.0 + rand_range(cseed, -jf, jf)));
+        float strength = saturate(c.response.z * (1.0 + rand_range(cseed, -js, js)));
+
+        // Always fully resolve penetration — a real collider never lets particles embed in the surface (the old
+        // `* strength` gate meant Strength = 0 left them glued inside). Strength now only scales how strongly the
+        // contact grabs velocity, below.
+        pos += nrm * penetration;
+        float vn = dot(vel, nrm);
+        float3 rv = vel;
+        // A small gravity impulse at a resting surface must be cancelled, not reflected: reflecting it produces a
+        // tiny upward hop every frame (visible jitter/flicker). Real physics engines call this a bounce threshold.
+        bool restingImpact = _CollisionSleepOn != 0u && vn < 0.0 && -vn <= _CollisionSleepSpeed;
+        if (vn < 0.0) rv -= nrm * vn * (restingImpact ? 1.0 : (1.0 + bounce));
+        float3 normalV  = nrm * max(dot(rv, nrm), 0.0);
+        float3 tangentV = (rv - normalV) * saturate(1.0 - friction);   // friction damps the tangential (sliding) part
+        // Strength = how firmly the surface acts on velocity. 1 = full bounce/friction response; 0 = the particle
+        // keeps its velocity and simply slides along the (still depenetrated) surface — slippery, never stuck.
+        vel = lerp(vel, normalV + tangentV, strength);
+        if (restingImpact)
+        {
+            // Strength is an artistic response control, but a resting contact still cannot retain inward velocity.
+            // Fully remove that residual so low Strength does not reintroduce gravity chatter.
+            float residualInward = min(dot(vel, nrm), 0.0);
+            vel -= nrm * residualInward;
+        }
+        float3 contactTangent = vel - nrm * dot(vel, nrm);
+        wakeTangentialSpeed = max(wakeTangentialSpeed, length(contactTangent));
+        float3 driveTangent = drivingDelta - nrm * dot(drivingDelta, nrm);
+        externallyDriven = externallyDriven || length(driveTangent) > 1e-4 || dot(drivingDelta, nrm) > 1e-4;
+    }
+
+    // Mesh-surface collision against the shared deforming triangle grid (one nearest-surface query / particle).
+    if (_MeshCollide != 0u)
+    {
+        int mtri; float3 mbary, mcpp, mnrm;
+        if (braze_grid_query(pos, _MeshContactRange, mtri, mbary, mcpp, mnrm))
+        {
+            float prm = size * _CollisionRadius;
+            float sd = dot(pos - mcpp, mnrm);            // signed distance to the surface (front +, behind −)
+            float penetration = prm - sd;
+            if (penetration > 0.0)
+            {
+                hadContact = true;
+                if (emitColl) emit_on_collision(mcpp, pseed, firedColl);   // fire / spawn at the surface hit
+                float bounce = saturate(_MeshResponse.x);
+                float friction = saturate(_MeshResponse.y);
+                float strength = saturate(_MeshResponse.z);
+                pos += mnrm * penetration;                    // always fully depenetrate (no embedding)
+                float vn = dot(vel, mnrm);
+                float3 rv = vel;
+                bool restingImpact = _CollisionSleepOn != 0u && vn < 0.0 && -vn <= _CollisionSleepSpeed;
+                if (vn < 0.0) rv -= mnrm * vn * (restingImpact ? 1.0 : (1.0 + bounce));
+                float3 normalV  = mnrm * max(dot(rv, mnrm), 0.0);
+                float3 tangentV = (rv - normalV) * saturate(1.0 - friction);
+                vel = lerp(vel, normalV + tangentV, strength);
+                if (restingImpact)
+                {
+                    float residualInward = min(dot(vel, mnrm), 0.0);
+                    vel -= mnrm * residualInward;
+                }
+                float3 contactTangent = vel - mnrm * dot(vel, mnrm);
+                wakeTangentialSpeed = max(wakeTangentialSpeed, length(contactTangent));
+                float3 driveTangent = drivingDelta - mnrm * dot(drivingDelta, mnrm);
+                externallyDriven = externallyDriven || length(driveTangent) > 1e-4 || dot(drivingDelta, mnrm) > 1e-4;
+            }
+        }
+    }
+
+    if (_CollisionSleepOn == 0u || !hadContact)
+    {
+        sleepFrames = 0u;
+        return;
+    }
+
+    // Strong impacts keep bouncing; meaningful motion along a surface is treated as a wake request so Wind,
+    // Radial/Vortex forces and moving emitters can move a previously sleeping particle. Steady gravity points
+    // into the support normal, is removed above, and therefore cannot wake the particle every frame.
+    if (externallyDriven || length(vel) > _CollisionSleepSpeed || wakeTangentialSpeed > _CollisionWakeSpeed)
+    {
+        sleepFrames = 0u;
+        return;
+    }
+
+    sleepFrames = min(sleepFrames + 1u, 255u);
+    if (sleepFrames >= max(_CollisionSleepFrames, 1u)) vel = float3(0.0, 0.0, 0.0);
+}
+
+// --- Clear ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void Clear(uint3 gid : SV_DispatchThreadID)
+{
+    uint i = FlatIndex(gid);
+    if (i >= _Capacity) return;
+    _Particles[i] = (Particle)0;
+}
+
+// Persist this frame's final clone centres after spawning. The next Emit dispatch can derive per-clone motion
+// entirely on the GPU, including animated distributions and positional effectors.
+[numthreads(64, 1, 1)]
+void CaptureClonerEmit(uint3 gid : SV_DispatchThreadID)
+{
+    uint i = FlatIndex(gid);
+    if (i >= _EmitClonerCount) return;
+    float3 position = _EmitClonerBasePosition[i].xyz + _EmitClonerPositionOffset[i].xyz;
+    _EmitClonerPreviousPosition[i] = float4(position, 1.0);
+}
+
+// Allocate a ring slot atomically (shared by continuous Emit and request-driven EmitRequests, so the
+// two never overwrite each other). Returns a seed derived from the unique slot + this frame.
+uint alloc_slot(out uint seed)
+{
+    uint raw; InterlockedAdd(_Head[0], 1u, raw);
+    uint slot = raw % _Capacity;
+    seed = hash_u32(_FrameSeed ^ hash_u32(raw + 0x9e3779b9u));
+    return slot;
+}
+
+// --- Emit (continuous, shape-based) --------------------------------------------------
+[numthreads(64, 1, 1)]
+void Emit(uint3 gid : SV_DispatchThreadID)
+{
+    uint i = FlatIndex(gid);
+    if (i >= _EmitCount) return;
+    uint seed; uint slot = alloc_slot(seed);
+    // Unity-style cap (Max Particles): never recycle a LIVING particle. If this ring slot is still alive,
+    // the pool is full here — drop the spawn. Existing particles live out their FULL lifetime; over-emission
+    // just thins the count, instead of recycling the oldest (which made the Lifetime setting look broken).
+    if (ParticleAlive(_Particles[slot])) return;
+
+    float life  = max(0.01, lerp(_StartLifetimeR.x, _StartLifetimeR.y, pcg(seed)));
+    float speed = lerp(_StartSpeedR.x, _StartSpeedR.y, pcg(seed));
+    float size  = max(0.0, lerp(_StartSizeR.x, _StartSizeR.y, pcg(seed)));
+    float rot   = lerp(_StartRotR.x, _StartRotR.y, pcg(seed));
+
+    float3 lp, ld, sv;
+    shape_emit(seed, lp, ld, sv);
+
+    // Empty masked region (GPU pass count 0) → no valid surface point; drop the spawn (slot stays dead, no origin spawn).
+    if (_ShapeKind == 8u && _EmitUsePassIdx != 0u && _PassCountRO[0] == 0u) return;
+    if (_ShapeKind == 12u && _EmitClonerCount == 0u) return;
+
+    // Mesh and Cloner yield final WORLD-space data; analytic shapes are emitter-local and bake through its Transform.
+    bool worldShape = _ShapeKind == 8u || _ShapeKind == 12u;
+    float3 pos = worldShape ? lp : mul(_EmitToWorld, float4(lp, 1.0)).xyz;
+    float3 dir = worldShape ? safe_norm(ld, float3(0, 1, 0)) : normalize(mul((float3x3)_EmitToWorld, ld));
+
+    Particle p = (Particle)0;
+    p.position = pos;
+    p.age      = 0.0;
+    p.velocity = dir * speed + _EmitInherit * sv + emitter_motion_velocity(pos, dir);
+    p.seed     = seed & 0x00ffffffu;
+    SetParticleLifeSize(p, life, size);   // base size = current size at spawn
+    SetParticleCurRot(p, size, rot);
+    SetParticleColor(p, _StartColor);
+    _Particles[slot] = p;
+}
+
+// --- EmitRequests: drain incoming spawn requests (from last frame) into fresh particles ----------
+[numthreads(64, 1, 1)]
+void EmitRequests(uint3 gid : SV_DispatchThreadID)
+{
+    uint i = FlatIndex(gid);
+    if (i >= _ReqCount[0] || i >= _ReqCapacity) return;
+    SpawnRequest rq = _Requests[i];
+
+    uint seed; uint slot = alloc_slot(seed);
+    if (ParticleAlive(_Particles[slot])) return;   // pool full here — drop (Unity-style: never recycle a living particle)
+    float life  = max(0.01, lerp(_StartLifetimeR.x, _StartLifetimeR.y, pcg(seed)));
+    float speed = lerp(_StartSpeedR.x, _StartSpeedR.y, pcg(seed));
+    float size  = max(0.0, lerp(_StartSizeR.x, _StartSizeR.y, pcg(seed)));
+    float rot   = lerp(_StartRotR.x, _StartRotR.y, pcg(seed));
+
+    uint flags = asuint(rq.position.w);
+    float4 col = (flags & 2u) ? rq.color : _StartColor;   // bit1 = inherit colour
+
+    // bit2 = attach: this particle rides source body (flags >> 3). rq.velocity.xyz carries the body-local offset.
+    bool attach = _AttachEnable != 0u && (flags & 4u) != 0u;
+    float3 vel = attach ? float3(0.0, 0.0, 0.0)
+                        : rand_sphere(seed) * speed + (((flags & 1u) != 0u) ? rq.velocity.xyz : float3(0.0, 0.0, 0.0));
+
+    Particle p = (Particle)0;
+    p.position = rq.position.xyz;
+    p.age      = 0.0;
+    p.velocity = vel;
+    p.seed     = seed & 0x00ffffffu;
+    SetParticleLifeSize(p, life, size);   // base size = current size at spawn
+    SetParticleCurRot(p, size, rot);
+    SetParticleColor(p, col);
+    _Particles[slot] = p;
+
+    if (_AttachWriteEnable != 0u)
+        _Attach[slot] = attach ? float4(rq.velocity.xyz, (float)((flags >> 3) + 1u)) : float4(0, 0, 0, 0);
+}
+
+// --- ClearReqCount: zero the request head after draining (ready for this frame's writes) ----------
+[numthreads(1, 1, 1)]
+void ClearReqCount(uint3 id : SV_DispatchThreadID) { _ReqCount[0] = 0u; }
+
+// --- Simulate ------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void Simulate(uint3 gid : SV_DispatchThreadID)
+{
+    uint i = FlatIndex(gid);
+    if (i >= _Capacity) return;
+
+    Particle p = _Particles[i];
+    float lifetime = ParticleLifetime(p);
+    if (lifetime <= 0.0) return;
+
+    float age = p.age + _Dt;
+    float nt = saturate(age / lifetime);
+    uint ps = ParticleRandomSeed(p);       // stable per-particle seed (sleep state occupies the high byte)
+    uint sleepFrames = ParticleSleepFrames(p);
+
+    float3 vel = p.velocity;
+
+    // Attachment: this particle rides a source body (e.g. a Voronoi chunk). Resolve its world position from the
+    // body's live transform + the stored body-local offset, and skip all free motion below. att.w = bodyIndex+1.
+    float4 att = float4(0, 0, 0, 0);
+    if (_AttachEnable != 0u) att = _Attach[i];   // guarded read (dummy is 1-elem when attach is off)
+    uint idxP1 = (uint)(att.w + 0.5);
+    bool attached = att.w > 0.5 && idxP1 >= 1u && idxP1 <= _AttachCount;
+    uint attBody = attached ? idxP1 - 1u : 0u;
+
+    // Velocity over lifetime (per-axis curve band, added in world space).
+    if (!attached && _VolEnable != 0u && _InfiniteLife == 0u)
+    {
+        float rx = rnd01(ps, 0x11u), ry = rnd01(ps, 0x12u), rz = rnd01(ps, 0x13u);
+        float2 cx = sample_curve(_VolXLut, nt);
+        float2 cy = sample_curve(_VolYLut, nt);
+        float2 cz = sample_curve(_VolZLut, nt);
+        float3 add = float3(lerp(cx.x, cx.y, rx), lerp(cy.x, cy.y, ry), lerp(cz.x, cz.y, rz));
+        vel += add * _Dt;
+    }
+
+    // Fluid-follow — carry the particle along the connected fluid's live velocity (advection). Applied after
+    // authored over-life velocity, before effectors. Forces are the final shaping pass, so a Vortex/Drag/etc.
+    // can deliberately override buoyant fluid drift instead of being erased by it.
+    if (!attached) apply_fluid_follow(vel, p.position, ps);
+
+    // Forces (wind / radial / vortex / drag) — world-space pushes from BrazeParticleForce components.
+    if (!attached) apply_particle_forces(vel, p.position, ps);
+    float3 drivingDelta = vel - p.velocity;  // used by contact sleep: tangential/outward effectors wake immediately
+
+    // Size over lifetime (multiplies the captured start size) — computed before collisions so the
+    // collision radius can scale with the particle's current size.
+    float baseSize = ParticleBaseSize(p);
+    float size = baseSize;
+    if (_SolEnable != 0u && _InfiniteLife == 0u)
+    {
+        float r = rnd01(ps, 0x21u);
+        float2 c = sample_curve(_SolLut, nt);
+        size = baseSize * lerp(c.x, c.y, r);
+    }
+
+    // Integrate, then resolve collisions against the new position (bounce / slide off colliders). Attached
+    // particles instead snap to their body's current world transform (rigid follow) — no integration/collision.
+    float3 pos;
+    if (attached)
+    {
+        sleepFrames = 0u;
+        pos = _AttachPosState[attBody].xyz + qrot(_AttachRot[attBody], att.xyz);
+        // Derive the ride velocity from this frame's displacement so Stretched billboards / colour-by-speed react
+        // to the chunk's motion (attached particles are otherwise velocity-less). Skip the first frame after spawn
+        // (age ~ _Dt), where the previous position is the spawn point and the delta is meaningless.
+        vel = (age > _Dt * 1.5) ? (pos - p.position) / max(_Dt, 1e-5) : float3(0.0, 0.0, 0.0);
+    }
+    else
+    {
+        pos = p.position + vel * _Dt;
+        if (_ColliderCount > 0u || _MeshCollide != 0u)
+            apply_particle_collisions(pos, vel, drivingDelta, size, ps, sleepFrames);
+        else
+            sleepFrames = 0u;
+        // (Surface Flow's position-based glue runs in the FlowConstrain kernel dispatched right after this
+        // one — Simulate sits at the 8-UAV limit and the constraint needs its own _FlowHint UAV.)
+    }
+
+    // Per-frame colour modules (Opacity/Colour over life, Colour by speed) modulate the particle's BASE colour
+    // fresh each frame — they must NOT read back last frame's already-modulated result, or they compound
+    // (e.g. Colour by Speed with Colour over Life off would multiply itself toward black every frame). Base =
+    // the emit colour (Start Colour, or an inherited colour) UNLESS a module owns that channel, in which case
+    // it rebuilds from Start Colour (matching Colour over Life's existing behaviour).
+    float4 pColor = ParticleColor(p);
+    float3 rgb = ((_ColEnable | _CbsEnable) != 0u) ? _StartColor.rgb : pColor.rgb;
+    float alpha = ((_OolEnable | _ColEnable | _CbsEnable) != 0u) ? _StartColor.a : pColor.a;
+
+    // Opacity over lifetime (multiplies the start alpha).
+    if (_OolEnable != 0u && _InfiniteLife == 0u)
+    {
+        float r = rnd01(ps, 0x31u);
+        float2 c = sample_curve(_OolLut, nt);
+        alpha = _StartColor.a * lerp(c.x, c.y, r);
+    }
+
+    // Colour over lifetime (gradient ramp by age; multiplies the start colour, alpha combines with Ool).
+    if (_ColEnable != 0u && _InfiniteLife == 0u)
+    {
+        float4 g = sample_gradient(_ColLut, nt);
+        rgb = _StartColor.rgb * g.rgb;
+        alpha *= g.a;
+    }
+
+    // Colour by speed (remap |vel| over the range → gradient, multiply in; stacks on the above).
+    if (_CbsEnable != 0u)
+    {
+        float t = saturate((length(vel) - _CbsRange.x) / max(_CbsRange.y - _CbsRange.x, 1e-5));
+        float4 g = sample_gradient(_CbsLut, t);
+        rgb *= g.rgb;
+        alpha *= g.a;
+    }
+
+    if (_InfiniteLife == 0u && age >= lifetime)
+    {
+        // ON DEATH event. (Chance roll uses an independent hash, so it's the same regardless of which
+        // over-life modules are enabled.)
+        if (_OnDeathOp != 0u && rnd01(ps, 0x41u) < _OnDeathChance)
+        {
+            if ((_OnDeathOp & 1u) != 0u)        // spawn particles into the target (drained next frame)
+            {
+                float flags = asfloat(_OnDeathInherit);
+                for (int k = 0; k < _OnDeathCount; k++)
+                {
+                    uint idx; InterlockedAdd(_ReqCount[0], 1u, idx);
+                    if (idx >= _ReqCapacity) break;          // overflow — drop the rest
+                    // Scatter each child within a sphere so they don't all stack on the death point.
+                    uint jseed = hash_u32(ps ^ hash_u32((uint)k * 0x9e3779b9u + 1u));
+                    float3 off = rand_sphere(jseed) * (_OnDeathPosJitter * pcg(jseed));
+                    SpawnRequest rq;
+                    // Inherit the parent's BASE colour (_StartColor), NOT the lifetime-faded current
+                    // colour — otherwise opacity/colour-over-life would spawn invisible/black children.
+                    rq.position = float4(p.position + off, flags);
+                    rq.velocity = float4(0.0, 0.0, 0.0, 0.0);   // children use their own Start Speed (no inheritance)
+                    rq.color    = _StartColor;
+                    _Requests[idx] = rq;
+                }
+            }
+            if ((_OnDeathOp & 2u) != 0u)        // fire Unity event — record a capped sample of world positions
+            {
+                uint e; InterlockedAdd(_EventCount[0], 1u, e);
+                if (e < _EventCapacity) _EventPos[e] = float4(p.position, 1.0);
+            }
+        }
+        SetParticleLifeSize(p, 0.0, ParticleBaseSize(p));   // kill (lifetime → 0)
+        _Particles[i] = p;
+        return;
+    }
+
+    p.position = pos;
+    p.velocity = vel;
+    p.age      = age;
+    SetParticleSleepFrames(p, sleepFrames);
+    float rotation = ParticleRotation(p);
+    bool sleeping = _CollisionSleepOn != 0u && sleepFrames >= max(_CollisionSleepFrames, 1u);
+    if (_MeshRotationEnable != 0u && !sleeping)
+        rotation += (_MeshSpin + _MeshSpinBySpeed * length(vel)) * _Dt;
+    SetParticleCurRot(p, size, rotation);              // current size + continuously integrated wrapped rotation
+    SetParticleColor(p, float4(rgb, alpha));
+    _Particles[i] = p;
+}
+
+// Surface Flow constraint pass — its own kernel so Simulate stays within the 8-UAV limit (this one needs only
+// the particle pool + the warm-start hints). Dispatched immediately after Simulate whenever a Surface Flow
+// force and its mesh grid are active, so the projection remains the final word on this frame's positions.
+[numthreads(64, 1, 1)]
+void FlowConstrain(uint3 gid : SV_DispatchThreadID)
+{
+    uint i = FlatIndex(gid);
+    if (i >= _Capacity) return;
+    Particle p = _Particles[i];
+    if (ParticleLifetime(p) <= 0.0) return;
+
+    if (_AttachEnable != 0u)             // attached particles rigidly follow a body — never constrain those
+    {
+        float4 att = _Attach[i];
+        uint idxP1 = (uint)(att.w + 0.5);
+        if (att.w > 0.5 && idxP1 >= 1u && idxP1 <= _AttachCount) return;
+    }
+
+    float3 pos = p.position;
+    float3 vel = p.velocity;
+    uint n = min(_ForceCount, 32u);
+    for (uint si = 0u; si < n; si++)
+    {
+        GpuForce f = _Forces[si];
+        if ((uint)f.position.w == 5u) apply_surface_flow_constraint(i, pos, vel, ParticleRandomSeed(p), si, f);
+    }
+    p.position = pos;
+    p.velocity = vel;
+    _Particles[i] = p;
+}
+
+// --- ResetArgs: zero the indirect instance count on the GPU (no CPU SetData / sync) --
+[numthreads(1, 1, 1)]
+void ResetArgs(uint3 id : SV_DispatchThreadID)
+{
+    _Indirect[0] = max(_VertexCount, 1u);   // verts per instance (6 = sprite quad; mesh = max index count)
+    _Indirect[1] = 0u;   // instanceCount — Compact accumulates into this
+    _Indirect[2] = 0u;
+    _Indirect[3] = 0u;
+}
+
+// --- Compact -------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void Compact(uint3 gid : SV_DispatchThreadID)
+{
+    uint i = FlatIndex(gid);
+    if (i >= _Capacity) return;
+
+    Particle p = _Particles[i];
+    if (!ParticleAlive(p)) return;
+
+    uint w;
+    InterlockedAdd(_Indirect[1], 1u, w);
+    _VisibleIndices[w] = i;
+}
+
+// --- Depth sort (Alpha blend only) ----------------------------------------------------------------------------
+// Alpha "over" compositing is order-dependent, and Compact's atomic append hands the draw a different order every
+// frame. Sort every alive sprite by render-space view depth so the visible list is deterministic and back-to-front.
+RWStructuredBuffer<uint2> _SortPairs;   // x = flipped sortable view depth, y = particle index
+float3 _SortCamPos;
+float3 _SortCamForward;
+float4x4 _SortModel;
+uint   _SortCount;                      // pow2 sort window (may exceed alive; padded with sentinels)
+uint   _SortJ, _SortK;                  // bitonic pass parameters
+
+uint FloatToOrderedUint(float v)
+{
+    uint bits = asuint(v);
+    return (bits & 0x80000000u) != 0u ? ~bits : (bits | 0x80000000u);
+}
+
+[numthreads(64, 1, 1)]
+void SortInit(uint3 gid : SV_DispatchThreadID)
+{
+    uint t = FlatIndex(gid);
+    if (t >= _SortCount) return;
+    if (t < _Indirect[1])
+    {
+        uint i = _VisibleIndices[t];
+        float3 worldPos = mul(_SortModel, float4(_Particles[i].position, 1.0)).xyz;
+        float viewDepth = dot(worldPos - _SortCamPos, _SortCamForward);
+        _SortPairs[t] = uint2(~FloatToOrderedUint(viewDepth), i);
+    }
+    else
+        _SortPairs[t] = uint2(0xFFFFFFFFu, 0xFFFFFFFFu);   // sorts past every alive entry
+}
+
+[numthreads(64, 1, 1)]
+void SortStep(uint3 gid : SV_DispatchThreadID)
+{
+    uint i = FlatIndex(gid);
+    if (i >= _SortCount) return;
+    uint j = i ^ _SortJ;
+    if (j <= i) return;                                    // each pair handled once, by its lower index
+    uint2 a = _SortPairs[i];
+    uint2 b = _SortPairs[j];
+    bool asc = (i & _SortK) == 0;
+    bool gt = a.x > b.x || (a.x == b.x && a.y > b.y);      // lexicographic (key, index) for deterministic ties
+    if (gt == asc) { _SortPairs[i] = b; _SortPairs[j] = a; }
+}
+
+[numthreads(64, 1, 1)]
+void SortScatter(uint3 gid : SV_DispatchThreadID)
+{
+    uint t = FlatIndex(gid);
+    if (t >= _SortCount || t >= _Indirect[1]) return;
+    _VisibleIndices[t] = _SortPairs[t].y;
+}
+
+// --- WriteMeshArgs: push the VISIBLE (culled) count into each mesh's RenderMeshIndirect command ---------------
+[numthreads(64, 1, 1)]
+void WriteMeshArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint m = id.x;
+    if (m >= _MeshArgCount) return;
+    _MeshArgsOut[m].instanceCount = _MeshCullCount[0];
+}
+
+// --- MeshCullReset / MeshCull: build the on-screen instance list for mesh-mode draws ----------------
+[numthreads(1, 1, 1)]
+void MeshCullReset(uint3 id : SV_DispatchThreadID) { _MeshCullCount[0] = 0u; }
+
+// Indirect: one thread per ALIVE particle from Compact's list (_VisibleIndices, count in _Indirect[1]), NOT one
+// per capacity slot. A system may allocate millions of slots but keep only thousands alive in mesh mode, so
+// scanning the whole pool (and re-rejecting dead slots Compact already dropped) was pure waste. Dispatched via
+// MeshCull's own args buffer (SepWriteArgs → ceil(alive/64), 1D, so it shares separation's ~4.19M-alive ceiling
+// — irrelevant for mesh mode, which is thousands of instances, not millions).
+[numthreads(64, 1, 1)]
+void MeshCull(uint3 id : SV_DispatchThreadID)
+{
+    uint t = id.x;
+    if (t >= _Indirect[1]) return;                   // alive count
+    uint i = _VisibleIndices[t];                     // real particle index (already alive-only — no dead re-check)
+    Particle p = _Particles[i];
+
+    if (_MeshCullOn != 0u)
+    {
+        float3 c = mul(_MeshCullModel, float4(p.position, 1.0)).xyz;
+        float  r = max(ParticleSize(p) * _MeshCullScale, 1e-4);
+        [unroll]
+        for (uint k = 0; k < 6u; k++)
+            if (dot(_MeshCullPlanes[k].xyz, c) + _MeshCullPlanes[k].w < -r) return;   // outside the frustum
+    }
+
+    uint w;
+    InterlockedAdd(_MeshCullCount[0], 1u, w);
+    _MeshCullVisible[w] = i;
+}
+
+// --- ExtractSkinnedEmit: read a SkinnedMeshRenderer's GPU-deformed vertex buffer straight into the emit
+// point/normal/velocity buffers, world-space, with NO CPU bake/readback/upload. The GPU already skinned the
+// mesh to render it; we just read that raw interleaved stream (same layout parsing as BrazeMeshExtract) and
+// transform on-GPU. Velocity = (current - previous) world position / dt, using a persistent _PrevPos buffer.
+ByteAddressBuffer _SrcVB;          // raw deformed vertex stream (SkinnedMeshRenderer.GetVertexBuffer())
+uint  _SrcStride;                  // bytes per vertex
+uint  _SrcPosOff;                  // byte offset of POSITION within a vertex
+uint  _SrcNrmOff;                  // byte offset of NORMAL within a vertex
+uint  _SrcHasNrm;                  // 1 if the stream carries a Float32x3 normal at _SrcNrmOff
+uint  _SrcVertCount;
+float4x4 _SrcL2W;                  // buffer→world for positions
+float4x4 _SrcN2W;                  // buffer→world for normals (inverse-transpose of L2W)
+float _InvDt;                      // 1 / max(dt, eps) for the velocity diff
+uint  _SrcHasPrev;                 // 0 on first frame / realloc → emit zero velocity (no spike)
+RWStructuredBuffer<float3> _OutPos;   // bound to the same buffer as _EmitPoints
+RWStructuredBuffer<float3> _OutNrm;   // bound to the same buffer as _EmitNormals
+RWStructuredBuffer<float3> _OutVel;   // bound to the same buffer as _EmitVelocities
+RWStructuredBuffer<float3> _PrevPos;  // persistent previous-frame world positions
+
+[numthreads(64, 1, 1)]
+void ExtractSkinnedEmit(uint3 gid : SV_DispatchThreadID)
+{
+    uint v = FlatIndex(gid);
+    if (v >= _SrcVertCount) return;
+
+    uint b = v * _SrcStride;
+    float3 lp = asfloat(_SrcVB.Load3(b + _SrcPosOff));    // position assumed Float32x3 (Unity skinned output)
+    float3 wp = mul(_SrcL2W, float4(lp, 1.0)).xyz;
+
+    float3 n = float3(0.0, 1.0, 0.0);
+    if (_SrcHasNrm != 0u)
+    {
+        float3 ln = asfloat(_SrcVB.Load3(b + _SrcNrmOff));
+        float3 wn = mul((float3x3)_SrcN2W, ln);
+        float l = length(wn);
+        n = l > 1e-8 ? wn / l : float3(0.0, 1.0, 0.0);
+    }
+
+    float3 vel = (_SrcHasPrev != 0u) ? (wp - _PrevPos[v]) * _InvDt : float3(0.0, 0.0, 0.0);
+
+    _OutPos[v] = wp;
+    _OutNrm[v] = n;
+    _OutVel[v] = vel;
+    _PrevPos[v] = wp;
+}
+
+// ExtractSkinnedSamples: same raw GPU-skinned vertex stream, but reconstructed through a stable rest-space sample set.
+// This is the resolution-independent Surface Mask path for skinned meshes: CPU builds the sample table only when the
+// mesh/sample count changes; every runtime pose, mask gate, velocity and spawn sample stays on GPU.
+StructuredBuffer<int>   _SampleIdx;       // 3 indices per sample
+StructuredBuffer<float> _SampleWeight;    // 3 barycentric/edge weights per sample
+uint _SampleCount;
+uint _SampleHasPrev;
+RWStructuredBuffer<float3> _PrevSamplePos;
+
+[numthreads(64, 1, 1)]
+void ExtractSkinnedSamples(uint3 gid : SV_DispatchThreadID)
+{
+    uint s = FlatIndex(gid);
+    if (s >= _SampleCount) return;
+
+    uint b = s * 3u;
+    int i0s = _SampleIdx[b + 0u];
+    int i1s = _SampleIdx[b + 1u];
+    int i2s = _SampleIdx[b + 2u];
+    if (i0s < 0 || i1s < 0 || i2s < 0) return;
+    uint i0 = (uint)i0s, i1 = (uint)i1s, i2 = (uint)i2s;
+    if (i0 >= _SrcVertCount || i1 >= _SrcVertCount || i2 >= _SrcVertCount) return;
+
+    float w0 = _SampleWeight[b + 0u];
+    float w1 = _SampleWeight[b + 1u];
+    float w2 = _SampleWeight[b + 2u];
+
+    uint p0b = i0 * _SrcStride;
+    uint p1b = i1 * _SrcStride;
+    uint p2b = i2 * _SrcStride;
+    float3 p0 = mul(_SrcL2W, float4(asfloat(_SrcVB.Load3(p0b + _SrcPosOff)), 1.0)).xyz;
+    float3 p1 = mul(_SrcL2W, float4(asfloat(_SrcVB.Load3(p1b + _SrcPosOff)), 1.0)).xyz;
+    float3 p2 = mul(_SrcL2W, float4(asfloat(_SrcVB.Load3(p2b + _SrcPosOff)), 1.0)).xyz;
+    float3 wp = p0 * w0 + p1 * w1 + p2 * w2;
+
+    float3 n = float3(0.0, 1.0, 0.0);
+    if (_SrcHasNrm != 0u)
+    {
+        float3 n0 = mul((float3x3)_SrcN2W, asfloat(_SrcVB.Load3(p0b + _SrcNrmOff)));
+        float3 n1 = mul((float3x3)_SrcN2W, asfloat(_SrcVB.Load3(p1b + _SrcNrmOff)));
+        float3 n2 = mul((float3x3)_SrcN2W, asfloat(_SrcVB.Load3(p2b + _SrcNrmOff)));
+        float3 wn = n0 * w0 + n1 * w1 + n2 * w2;
+        float nl = length(wn);
+        n = nl > 1e-8 ? wn / nl : n;
+    }
+    else
+    {
+        float3 fn = cross(p1 - p0, p2 - p0);
+        float fl = length(fn);
+        if (fl > 1e-8) n = fn / fl;
+    }
+
+    float3 vel = (_SampleHasPrev != 0u) ? (wp - _PrevSamplePos[s]) * _InvDt : float3(0.0, 0.0, 0.0);
+
+    _OutPos[s] = wp;
+    _OutNrm[s] = n;
+    _OutVel[s] = vel;
+    _PrevSamplePos[s] = wp;
+}
+
+// --- MaskGate: evaluate the surface-mask field per REST vertex and compact the passing vertex indices --------------
+// The field (BrazeMaskField.hlsl) is the SAME code the preview shader runs. Each constant rest position is transformed
+// into Braze mask space before evaluation. Passing indices are appended to _GatePassIdx with an atomic counter
+// (_PassCount); Emit then samples spawns only from those.
+StructuredBuffer<float3>  _RestPos;       // mesh-local REST positions (constant), indexed by vertex
+float4x4 _RestLocalToField;               // mesh-local REST position → Braze mask field space
+RWStructuredBuffer<uint>  _GatePassIdx;   // out: compacted passing vertex indices (same buffer Emit reads as _EmitPassIdx)
+RWStructuredBuffer<uint>  _PassCount;     // out: number of passing verts (cleared to 0 each frame before dispatch)
+uint _RestCount;
+
+[numthreads(64, 1, 1)]
+void MaskGate(uint3 gid : SV_DispatchThreadID)
+{
+    uint v = FlatIndex(gid);
+    if (v >= _RestCount) return;
+    float3 fieldPos = mul(_RestLocalToField, float4(_RestPos[v], 1.0)).xyz;
+    if (MaskFieldWeight(fieldPos) > 1e-3)
+    {
+        uint slot;
+        InterlockedAdd(_PassCount[0], 1u, slot);
+        _GatePassIdx[slot] = v;
+    }
+}
+
+// ── Inter-particle separation ────────────────────────────────────────────────────────────────────────────
+// Particles only collide with static colliders, never with each other, so they freely interpenetrate and
+// "merge" when they pile up. This pass pushes overlapping neighbours apart (position-based) so a pile reads
+// as solid. A uniform spatial hash (linked-list-per-bucket) finds neighbours; the rest distance is the sum of
+// the two contact radii (size × Collision Radius, like the static collider). Run as: SepClearGrid → SepWriteArgs
+// → SepBuildGrid → SepSolve (accumulate push) → SepApply (apply + re-depenetrate). Read/write are split across
+// Solve/Apply so neighbour positions are read consistently (no in-pass race).
+//
+// Build/Solve/Apply iterate the COMPACTED alive list (_SepVisible, count = _SepArgs[1]) via an indirect
+// dispatch, so they cost the alive-particle count — NOT the full pool capacity — with no dead threads in a wave.
+
+RWStructuredBuffer<int>    _CellHead;   // hash bucket → newest particle slot (or -1); size = _SepTableMask+1
+RWStructuredBuffer<int>    _PartNext;   // particle slot → next in its bucket chain (or -1); size = _Capacity
+RWStructuredBuffer<float4> _SepDisp;    // per-slot accumulated push (xyz); size = _Capacity
+StructuredBuffer<uint>     _SepVisible; // compacted alive slot indices (the system's visible list)
+StructuredBuffer<uint>     _SepArgs;    // the draw-args buffer; [1] = alive count
+RWStructuredBuffer<uint>   _SepDispatchArgs;   // indirect compute args [groupsX, 1, 1]
+
+uint  _SepTableMask;   // hash table size − 1 (table size is a power of two)
+float _SepCellSize;    // grid cell size = 2 × max contact radius (so the 3×3×3 query covers any overlap)
+float _SepScale;       // multiplies the contact radius → separation rest radius
+float _SepStiffness;   // 0..1 fraction of the computed push applied this iteration
+
+uint sep_hash(int3 c)
+{
+    uint h = (uint)(c.x * 73856093) ^ (uint)(c.y * 19349663) ^ (uint)(c.z * 83492791);
+    return h & _SepTableMask;
+}
+int3 sep_cell(float3 p) { return (int3)floor(p / max(_SepCellSize, 1e-4)); }
+
+[numthreads(64, 1, 1)]
+void SepClearGrid(uint3 gid : SV_DispatchThreadID)   // dispatched over the hash-table size
+{
+    uint i = FlatIndex(gid);
+    if (i > _SepTableMask) return;
+    _CellHead[i] = -1;
+}
+
+// One thread: turn the alive count into a 1-D indirect dispatch size (64 threads/group).
+[numthreads(1, 1, 1)]
+void SepWriteArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint alive = _SepArgs[1];
+    // Cap at the 65535-per-dimension group limit (≈4.19M particles); self-collision past that is impractical.
+    _SepDispatchArgs[0] = min((alive + 63u) / 64u, 65535u);   // groupsX
+    _SepDispatchArgs[1] = 1u;
+    _SepDispatchArgs[2] = 1u;
+}
+
+[numthreads(64, 1, 1)]
+void SepBuildGrid(uint3 id : SV_DispatchThreadID)   // indirect: one thread per alive particle
+{
+    uint t = id.x;
+    if (t >= _SepArgs[1]) return;
+    uint slot = _SepVisible[t];
+    Particle p = _Particles[slot];
+    uint h = sep_hash(sep_cell(p.position));
+    int prev;
+    InterlockedExchange(_CellHead[h], (int)slot, prev);   // push this slot as the bucket head
+    _PartNext[slot] = prev;
+}
+
+[numthreads(64, 1, 1)]
+void SepSolve(uint3 id : SV_DispatchThreadID)   // indirect: one thread per alive particle
+{
+    uint t = id.x;
+    if (t >= _SepArgs[1]) return;
+    uint slot = _SepVisible[t];
+    Particle pi = _Particles[slot];
+
+    float3 posi = pi.position;
+    float  ri   = ParticleSize(pi) * _CollisionRadius * _SepScale;
+    int3   c0   = sep_cell(posi);
+    float3 push = float3(0, 0, 0);
+
+    // Visit the 3×3×3 neighbourhood; the bucket chain may also hold far particles (hash collisions), so the
+    // rest-distance check below is what actually decides a contact. Per-chain walk is capped to bound cost.
+    [unroll]
+    for (int dz = -1; dz <= 1; dz++)
+    [unroll]
+    for (int dy = -1; dy <= 1; dy++)
+    [unroll]
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        uint h = sep_hash(c0 + int3(dx, dy, dz));
+        int j = _CellHead[h];
+        int guard = 0;
+        while (j >= 0 && guard < 64)
+        {
+            if (j != (int)slot)
+            {
+                Particle pj = _Particles[j];
+                float3 d = posi - pj.position;
+                float  rest = ri + ParticleSize(pj) * _CollisionRadius * _SepScale;
+                float  dist2 = dot(d, d);
+                if (dist2 < rest * rest)
+                {
+                    float dist = sqrt(max(dist2, 1e-12));
+                    // Coincident particles get a deterministic per-pair nudge so they don't lock together.
+                    uint nudge = hash_u32((uint)slot ^ hash_u32((uint)j));   // rand_sphere takes inout → needs an lvalue
+                    float3 dir = (dist > 1e-5) ? d / dist : normalize(rand_sphere(nudge) + 1e-4);
+                    push += dir * (rest - dist) * 0.5;   // split the overlap; the neighbour pushes the other half
+                }
+            }
+            j = _PartNext[j];
+            guard++;
+        }
+    }
+    _SepDisp[slot] = float4(push, 0);
+}
+
+// Position-only depenetration so the separation push can't shove a particle into a static collider.
+void sep_depenetrate(inout float3 pos, float size)
+{
+    float pr = size * _CollisionRadius;
+    uint n = min(_ColliderCount, 16u);
+    for (uint k = 0; k < n; k++)
+    {
+        GpuCollider c = _Colliders[k];
+        uint shape = (uint)c.center.w;
+        float4 hit = (shape == 0u) ? collide_plane(pos, float3(0, 0, 0), c, pr)
+                   : (shape == 1u) ? collide_sphere(pos, c, pr)
+                                   : collide_box(pos, c, pr);
+        if (hit.w > 0.0) pos += hit.xyz * hit.w;
+    }
+    if (_MeshCollide != 0u)
+    {
+        int mtri; float3 mbary, mcpp, mnrm;
+        if (braze_grid_query(pos, _MeshContactRange, mtri, mbary, mcpp, mnrm))
+        {
+            float pen = (size * _CollisionRadius) - dot(pos - mcpp, mnrm);
+            if (pen > 0.0) pos += mnrm * pen;
+        }
+    }
+}
+
+[numthreads(64, 1, 1)]
+void SepApply(uint3 id : SV_DispatchThreadID)   // indirect: one thread per alive particle
+{
+    uint t = id.x;
+    if (t >= _SepArgs[1]) return;
+    uint slot = _SepVisible[t];
+    Particle p = _Particles[slot];
+    float3 pos = p.position + _SepDisp[slot].xyz * _SepStiffness;
+    if (_ColliderCount > 0u || _MeshCollide != 0u) sep_depenetrate(pos, ParticleSize(p));
+    p.position = pos;
+    _Particles[slot] = p;
+}

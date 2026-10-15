@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 7ef346318e4c04d6d9315c42caf0c120
+ShaderIncludeImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Resources/BrazeMeshGrid.hlsl
+  uploadId: 959622

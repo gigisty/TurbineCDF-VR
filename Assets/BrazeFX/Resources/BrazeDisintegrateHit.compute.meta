@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 1e5dbf76293584493a510648b9b5e2e5
+ComputeShaderImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Resources/BrazeDisintegrateHit.compute
+  uploadId: 959622

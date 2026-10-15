@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: 0d378b09023484c979ce45089048eb1e
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 11400000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Z-Demo Assets/Caches/Wall Cache/Wall_FractureBake.asset
+  uploadId: 959622

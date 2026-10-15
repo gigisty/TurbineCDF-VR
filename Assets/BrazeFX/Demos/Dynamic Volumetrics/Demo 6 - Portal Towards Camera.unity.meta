@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 6347382aca1ff45abaf5f36d4db1a89b
+DefaultImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/Dynamic Volumetrics/Demo 6 - Portal Towards Camera.unity
+  uploadId: 959622

@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: d48a976613cbb416b98a0e7d06b4b80f
+ShaderIncludeImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Resources/BrazeNoise.hlsl
+  uploadId: 959622

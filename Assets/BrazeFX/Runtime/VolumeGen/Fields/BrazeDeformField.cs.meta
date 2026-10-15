@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: dfe695d07401a474c81deb18a228d4b7
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {fileID: 2800000, guid: b77173e66a3e242da87b7994b6c73c85, type: 3}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Runtime/VolumeGen/Fields/BrazeDeformField.cs
+  uploadId: 959622

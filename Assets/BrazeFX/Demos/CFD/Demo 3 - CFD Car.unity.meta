@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: cfd46b242d1e34a22a44acf45c47dbaa
+DefaultImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Demos/CFD/Demo 3 - CFD Car.unity
+  uploadId: 959622

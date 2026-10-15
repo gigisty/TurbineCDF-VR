@@ -1,0 +1,370 @@
+// BrazeFX CFD static-mesh signed-distance baker.
+// Scratch buffers are allocated only while input geometry changes. The persistent product is one RHalf 3D SDF.
+
+#pragma kernel ClearSeeds
+#pragma kernel VoxelizeTriangles
+#pragma kernel InitSeeds
+#pragma kernel JumpFlood
+#pragma kernel FloodInit
+#pragma kernel FloodSweep
+#pragma kernel FinalizeSdf
+#pragma kernel SampleVolumePoints
+
+StructuredBuffer<float3> _Vertices;
+StructuredBuffer<int> _Indices;
+StructuredBuffer<float4> _TriangleSettings; // x mode, y shell thickness world, z solid offset world
+RWStructuredBuffer<uint> _SeedTriangles;
+StructuredBuffer<uint> _SeedRead;
+RWStructuredBuffer<uint> _SeedWrite;
+StructuredBuffer<uint> _FloodState;
+RWTexture3D<float> _SignedDistance;
+Texture3D<float> _VolumeRead;
+StructuredBuffer<int3> _SampleCoordinates;
+RWStructuredBuffer<float> _SampleValues;
+
+int3 _BakeRes;
+int _VoxelCount;
+int _TriangleCount;
+uint _InvalidSeed;
+int _JumpStep;
+float _FloodSealWorld;  // wall radius for the reachability flood (~0.55 of the largest bake voxel)
+int _SweepAxis;         // flood sweep: 0 = X lines, 1 = Y lines, 2 = Z lines
+int _SweepDir;          // flood sweep direction along the axis: +1 or -1
+// Per-axis voxel→world scale. The bake grid is normally near-cubic, but the per-axis resolution clamp and
+// rounding can leave anisotropic voxels for thin or strongly stretched domains/bodies — distances must be
+// measured in world units per axis or the SDF (and the coverage shell built from it) distorts along the
+// stretched direction.
+float3 _VoxelToWorld;
+float _NarrowBandWorld;
+int _SampleCount;
+
+// Triangle seeds retain 10-bit distance ordering + a 22-bit triangle index. A 256^3 bake needs only 24 index
+// bits, so a 25-bit all-ones sentinel remains distinct from every valid JFA cell index.
+static const uint TriangleInvalidSeed = 0xffffffffu;
+static const uint JfaIndexMask = 0x01ffffffu;
+static const uint TriangleIndexMask = 0x003fffffu;
+
+// Reachability-flood cell states. Wall cells never become air; unknown cells that the flood cannot reach are
+// solid by definition (sealed cavities, true interiors, and bodies extending past the domain all land there).
+static const uint FloodUnknown = 0u;
+static const uint FloodAir = 1u;
+static const uint FloodWall = 2u;
+
+uint LinearIndex(uint3 p)
+{
+    return p.x + (uint)_BakeRes.x * (p.y + (uint)_BakeRes.y * p.z);
+}
+
+uint3 DecodeIndex(uint index)
+{
+    uint rx = (uint)_BakeRes.x;
+    uint ry = (uint)_BakeRes.y;
+    return uint3(index % rx, (index / rx) % ry, index / (rx * ry));
+}
+
+float3 ClosestPointTriangle(float3 p, float3 a, float3 b, float3 c)
+{
+    float3 ab = b - a;
+    float3 ac = c - a;
+    float3 ap = p - a;
+    float d1 = dot(ab, ap);
+    float d2 = dot(ac, ap);
+    float3 result = a;
+    if (!(d1 <= 0.0 && d2 <= 0.0))
+    {
+        float3 bp = p - b;
+        float d3 = dot(ab, bp);
+        float d4 = dot(ac, bp);
+        if (d3 >= 0.0 && d4 <= d3)
+        {
+            result = b;
+        }
+        else
+        {
+            float vc = d1 * d4 - d3 * d2;
+            if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0)
+            {
+                result = a + (d1 / max(d1 - d3, 1e-20)) * ab;
+            }
+            else
+            {
+                float3 cp = p - c;
+                float d5 = dot(ab, cp);
+                float d6 = dot(ac, cp);
+                if (d6 >= 0.0 && d5 <= d6)
+                {
+                    result = c;
+                }
+                else
+                {
+                    float vb = d5 * d2 - d1 * d6;
+                    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0)
+                    {
+                        result = a + (d2 / max(d2 - d6, 1e-20)) * ac;
+                    }
+                    else
+                    {
+                        float va = d3 * d6 - d5 * d4;
+                        if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0)
+                        {
+                            result = b + ((d4 - d3) /
+                                max((d4 - d3) + (d5 - d6), 1e-20)) * (c - b);
+                        }
+                        else
+                        {
+                            float denom = 1.0 / max(va + vb + vc, 1e-20);
+                            result = a + ab * (vb * denom) + ac * (vc * denom);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
+
+[numthreads(256, 1, 1)]
+void ClearSeeds(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= (uint)_VoxelCount) return;
+    _SeedTriangles[tid.x] = TriangleInvalidSeed;
+}
+
+// Faithful triangle narrow band, adapted from the publisher-owned sparse-flip prototype's mesh_sdf.wgsl.
+// One invocation rasterizes the expanded
+// AABB of one polygon and evaluates the exact closest point in WORLD metric at every candidate voxel centre.
+// Keeping a 2.5-cell band means every shell/solid zero crossing uses an actual polygon distance; jump flood is
+// only a cheap extension of the far field. The previous one-cell surface seeds chose a nearby seed VOXEL first,
+// which produced diagonal seams, bubbles and holes on thin oblique blades even when the source mesh was clean.
+[numthreads(64, 1, 1)]
+void VoxelizeTriangles(uint3 tid : SV_DispatchThreadID)
+{
+    uint tri = tid.x;
+    if (tri >= (uint)_TriangleCount) return;
+    float3 a = _Vertices[_Indices[tri * 3u + 0u]];
+    float3 b = _Vertices[_Indices[tri * 3u + 1u]];
+    float3 c = _Vertices[_Indices[tri * 3u + 2u]];
+    float3 safeVoxelToWorld = max(_VoxelToWorld, (float3)1e-8);
+    float3 padVoxels = _NarrowBandWorld / safeVoxelToWorld + 1.0;
+    int3 lo = max((int3)floor(min(a, min(b, c)) - padVoxels), int3(0, 0, 0));
+    int3 hi = min((int3)ceil(max(a, max(b, c)) + padVoxels), _BakeRes - 1);
+    float3 aw = a * _VoxelToWorld;
+    float3 bw = b * _VoxelToWorld;
+    float3 cw = c * _VoxelToWorld;
+    for (int z = lo.z; z <= hi.z; z++)
+    for (int y = lo.y; y <= hi.y; y++)
+    for (int x = lo.x; x <= hi.x; x++)
+    {
+        float3 p = (float3(x, y, z) + 0.5) * _VoxelToWorld;
+        float3 q = ClosestPointTriangle(p, aw, bw, cw);
+        float distanceWorld = length(p - q);
+        if (!(distanceWorld <= _NarrowBandWorld)) continue; // also rejects NaN
+        // 1023/all-ones together with the maximum triangle index would collide with TriangleInvalidSeed, so
+        // valid distances use [0,1022]. Ties deterministically fall through to the triangle index.
+        uint quantized = min((uint)round(distanceWorld / max(_NarrowBandWorld, 1e-8) * 1022.0), 1022u);
+        uint packed = (quantized << 22u) | (tri & TriangleIndexMask);
+        uint ignored;
+        InterlockedMin(_SeedTriangles[LinearIndex(uint3(x, y, z))], packed, ignored);
+    }
+}
+
+[numthreads(4, 4, 4)]
+void InitSeeds(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_BakeRes)) return;
+    uint index = LinearIndex(id);
+    _SeedWrite[index] = _SeedTriangles[index] == TriangleInvalidSeed ? _InvalidSeed : index;
+}
+
+[numthreads(4, 4, 4)]
+void JumpFlood(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_BakeRes)) return;
+    uint index = LinearIndex(id);
+    uint best = _SeedRead[index];
+    float3 bestDelta = best == _InvalidSeed ? (float3)0.0
+        : (float3(id) - float3(DecodeIndex(best))) * _VoxelToWorld;
+    float bestDistance = best == _InvalidSeed ? 3.402823466e+38 : dot(bestDelta, bestDelta);
+
+    [unroll]
+    for (int z = -1; z <= 1; z++)
+    [unroll]
+    for (int y = -1; y <= 1; y++)
+    [unroll]
+    for (int x = -1; x <= 1; x++)
+    {
+        int3 samplePos = int3(id) + int3(x, y, z) * _JumpStep;
+        if (any(samplePos < 0) || any(samplePos >= _BakeRes)) continue;
+        uint candidate = _SeedRead[LinearIndex((uint3)samplePos)];
+        if (candidate == _InvalidSeed) continue;
+        // World-metric comparison so "nearest seed" stays correct when bake voxels are anisotropic.
+        float3 delta = (float3(id) - float3(DecodeIndex(candidate))) * _VoxelToWorld;
+        float distanceSq = dot(delta, delta);
+        if (distanceSq < bestDistance || (distanceSq == bestDistance && candidate < best))
+        {
+            bestDistance = distanceSq;
+            best = candidate;
+        }
+    }
+    _SeedWrite[index] = best;
+}
+
+int3 LinePosition(int axis, int cursor, int u, int v)
+{
+    int3 result = int3(cursor, u, v);
+    if (axis == 1) result = int3(u, cursor, v);
+    else if (axis == 2) result = int3(u, v, cursor);
+    return result;
+}
+
+// Single initialized return — Metal falsely flags multi-exit helpers as potentially uninitialized.
+int2 PlaneResolution(int axis)
+{
+    int2 result = _BakeRes.xy;
+    if (axis == 0) result = _BakeRes.yz;
+    else if (axis == 1) result = _BakeRes.xz;
+    return result;
+}
+
+// ── Sign by reachability, not parity ─────────────────────────────────────────────────────────────────────────
+// Ground-truth meshes are triangle soup: open sheets (a hood with no underside), self-intersecting components
+// (wheels in arches), T-junctions, duplicated and reversed faces. Any crossing-parity or winding scheme silently
+// assumes a closed 2-manifold, and each violation acted at a distance — one open sheet flipped parity for the
+// REST of the ray (floating solid blobs in clear air), overlapping solids XOR-ed each other hollow, T-junction
+// rays double-counted into stripes. Reachability depends only on geometric proximity: cells within
+// _FloodSealWorld of ANY triangle are walls; air floods 6-connected from the domain boundary; whatever the flood
+// cannot reach is solid. A degenerate triangle can only wall its own half-voxel neighbourhood, floating blobs
+// are impossible by construction, and overlapping bodies union instead of cancelling. Open cavities (a cabin
+// with open windows) flood to quiescent dead air — which is also what real air would do — while the wall band
+// keeps every sheet at least one voxel airtight. The seal radius must stay >= half the largest voxel axis or a
+// 6-connected path could slip between two cell centres straddling a surface.
+[numthreads(4, 4, 4)]
+void FloodInit(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_BakeRes)) return;
+    uint index = LinearIndex(id);
+    uint payload = _SeedTriangles[index];
+    bool wall = false;
+    if (payload != TriangleInvalidSeed)
+    {
+        // The narrow band's 10-bit quantized distance resolves ~1/400 voxel here — ample for a wall test.
+        float bandDistance = (float)(payload >> 22u) / 1022.0 * _NarrowBandWorld;
+        wall = bandDistance <= _FloodSealWorld;
+    }
+    bool boundary = any(id == 0u) || any(id == (uint3)(_BakeRes - 1));
+    _SeedWrite[index] = wall ? FloodWall : (boundary ? FloodAir : FloodUnknown);
+}
+
+// One thread owns one full grid line and propagates air serially along it; walls break the run. Rounds of six
+// directional sweeps (±X, ±Y, ±Z) converge for any cavity whose entry path needs at most a few turns per round;
+// unconverged cells remain FloodUnknown = solid, which is the conservative side.
+// Each iteration derives the cell's next state locally and stores it exactly once — Unity 6000.0's Windows FXC
+// fails internally ("flattened side effect") on the natural conditional-UAV-store/continue form. The thread owns
+// its whole line, so rewriting unchanged cells is race-free and the propagation is identical.
+[numthreads(8, 8, 1)]
+void FloodSweep(uint3 id : SV_DispatchThreadID)
+{
+    int2 planeRes = PlaneResolution(_SweepAxis);
+    if ((int)id.x >= planeRes.x || (int)id.y >= planeRes.y) return;
+    int length = _SweepAxis == 0 ? _BakeRes.x : (_SweepAxis == 1 ? _BakeRes.y : _BakeRes.z);
+    bool carry = false;
+    for (int s = 0; s < length; s++)
+    {
+        int cursor = _SweepDir > 0 ? s : length - 1 - s;
+        uint index = LinearIndex((uint3)LinePosition(_SweepAxis, cursor, (int)id.x, (int)id.y));
+        uint state = _SeedWrite[index];
+        uint outputState = state;
+        if (state == FloodWall)
+        {
+            carry = false;
+        }
+        else
+        {
+            if (state == FloodAir)
+                carry = true;
+            else if (carry)
+                outputState = FloodAir;
+        }
+        _SeedWrite[index] = outputState;
+    }
+}
+
+// Flood state at an arbitrary world position, clamped to the grid. Single initialized return (Metal).
+uint FloodStateAtWorld(float3 world)
+{
+    int3 cell = clamp((int3)floor(world / _VoxelToWorld), int3(0, 0, 0), _BakeRes - 1);
+    return _FloodState[LinearIndex((uint3)cell)];
+}
+
+[numthreads(4, 4, 4)]
+void FinalizeSdf(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_BakeRes)) return;
+    uint index = LinearIndex(id);
+    uint packedSeed = _SeedRead[index];
+    uint seed = packedSeed & JfaIndexMask;
+    if (seed == _InvalidSeed)
+    {
+        _SignedDistance[id] = 65504.0;
+        return;
+    }
+
+    // Inside the faithful narrow band, use THIS voxel's atomically-nearest triangle directly. Only the far field
+    // falls back to the nearest jump-flood seed cell. This keeps the collision zero crossing exact even though
+    // the inexpensive far-field extension is approximate.
+    uint localPayload = _SeedTriangles[index];
+    uint payload = localPayload != TriangleInvalidSeed ? localPayload : _SeedTriangles[seed];
+    uint tri = payload & TriangleIndexMask;
+    float3 a = _Vertices[_Indices[tri * 3u + 0u]] * _VoxelToWorld;
+    float3 b = _Vertices[_Indices[tri * 3u + 1u]] * _VoxelToWorld;
+    float3 c = _Vertices[_Indices[tri * 3u + 2u]] * _VoxelToWorld;
+    float3 p = (float3(id) + 0.5) * _VoxelToWorld;
+    float3 closest = ClosestPointTriangle(p, a, b, c);
+    float unsignedDistance = length(p - closest);
+
+    // Sign: air-reached cells are outside, unreached cells are inside. Raw flood classification quantizes the
+    // zero crossing to wall-cell granularity (the interpolated iso lands at the harmonic mean of neighbouring
+    // cell distances and wobbles up to ~0.8 voxel — visible terracing on every open sheet), so band cells are
+    // refined with two flood probes along the surface direction, using only geometry + reachability:
+    //   ahead solid  -> the cell's own side is solid-backed: interior, exact -d.
+    //   behind solid -> thick body, cell on the air side: exact +d (sub-voxel-smooth crossing).
+    //   air on both  -> open sheet: d - seal, so the iso sits at ONE constant seal offset instead of rippling,
+    //                   and the sheet keeps its airtight skin.
+    // A leak would need a connected all-positive path: +d appears only where the surface is backed by solid
+    // (path blocked by that interior) or beyond a sheet's seal iso — so airtightness is preserved by construction.
+    // The 1.6-voxel probe depth clears the 0.55-voxel wall band plus the worst diagonal cell-centre offset;
+    // bodies thinner than it simply classify as sheets, which is the conservative (sealed) side.
+    uint state = _FloodState[index];
+    float signedDistance;
+    if (localPayload == TriangleInvalidSeed || state == FloodUnknown)
+    {
+        signedDistance = state == FloodAir ? unsignedDistance : -unsignedDistance;
+    }
+    else
+    {
+        float largestVoxel = max(_VoxelToWorld.x, max(_VoxelToWorld.y, _VoxelToWorld.z));
+        float probeDepth = largestVoxel * 1.6;
+        float3 direction = (p - closest) / max(unsignedDistance, 1e-6);
+        bool degenerate = unsignedDistance <= 1e-6;
+        bool airAhead = !degenerate && FloodStateAtWorld(p + direction * probeDepth) == FloodAir;
+        bool airBehind = !degenerate && FloodStateAtWorld(closest - direction * probeDepth) == FloodAir;
+        if (!airAhead) signedDistance = -unsignedDistance;
+        else if (!airBehind) signedDistance = unsignedDistance;
+        else signedDistance = unsignedDistance - _FloodSealWorld;
+    }
+
+    float4 settings = _TriangleSettings[tri];
+    float sdf = settings.x < 0.5
+        ? signedDistance - settings.z
+        : unsignedDistance - settings.y * 0.5;   // shells are pure polygon distance; sign refinement never applies
+    _SignedDistance[id] = sdf;
+}
+
+// Tiny point sampler used by asynchronous CFD probes and GPU regression tests. It is never part of a sim tick.
+[numthreads(64, 1, 1)]
+void SampleVolumePoints(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= (uint)_SampleCount) return;
+    int3 p = _SampleCoordinates[tid.x];
+    _SampleValues[tid.x] = _VolumeRead.Load(int4(p, 0));
+}

@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: db44259c3f2148398e42fc7d8ea4fc4e
+ShaderIncludeImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 395404
+  packageName: BrazeFX - Real-Time Volumetric Fire, Smoke & VFX
+  packageVersion: 1.0.0
+  assetPath: Assets/BrazeFX/Shaders/Shared/BrazeSlicesCore.hlsl
+  uploadId: 959622
