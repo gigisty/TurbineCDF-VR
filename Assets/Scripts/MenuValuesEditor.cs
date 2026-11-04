@@ -1,4 +1,5 @@
 using BrazeFX.CFD;
+using BrazeFX;
 using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
@@ -9,10 +10,13 @@ public class MenuValuesEditor : MonoBehaviour
     public BrazeCfdDomain cFDDomain;
     public BrazeCfdTestBody testBody;
     public BrazeCfdWindTunnel windTunnel;
+    public BrazeMotion motionBody;
 
     [Header("UI Elements")]
     public Slider windSpeedSlider;
     public TMP_Text windSpeedText;
+    public Slider motionSpeedSlider;
+    public TMP_Text motionSpeedText;
     public Button toggleBuoyancyButton;
 
     private bool isBuoyancyActive = false;
@@ -25,12 +29,19 @@ public class MenuValuesEditor : MonoBehaviour
             windSpeedSlider.minValue = 0f;
             windSpeedSlider.maxValue = 10f;
 
+            motionSpeedSlider.minValue = 0f;
+            motionSpeedSlider.maxValue = 2f;
+
             // 2. Sincroniza la posición del Slider con el valor actual de airSpeed
             windSpeedSlider.value = windTunnel.airSpeed;
             windSpeedText.text = windTunnel.airSpeed.ToString();
 
+            motionSpeedSlider.value = motionBody.strength;
+            motionSpeedText.text = motionBody.strength.ToString();
+
             // 3. Escucha los cambios del Slider
             windSpeedSlider.onValueChanged.AddListener(UpdateAirSpeed);
+            motionSpeedSlider.onValueChanged.AddListener(UpdateMotionSpeed);
         }
     }
 
@@ -40,6 +51,15 @@ public class MenuValuesEditor : MonoBehaviour
         {
             windTunnel.airSpeed = newSpeed;
             windSpeedText.text = newSpeed.ToString("F2");
+        }
+    }
+
+    public void UpdateMotionSpeed(float newStrenght)
+    {
+        if (motionBody != null)
+        {
+            motionBody.strength = newStrenght;
+            motionSpeedText.text = newStrenght.ToString("F2");
         }
     }
 }
