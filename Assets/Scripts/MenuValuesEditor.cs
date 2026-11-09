@@ -11,6 +11,7 @@ public class MenuValuesEditor : MonoBehaviour
     public BrazeCfdTestBody testBody;
     public BrazeCfdWindTunnel windTunnel;
     public BrazeMotion motionBody;
+    public FormulaCalculator formulaCalc;
 
     [Header("UI Elements")]
     public Slider windSpeedSlider;
@@ -51,6 +52,13 @@ public class MenuValuesEditor : MonoBehaviour
         {
             windTunnel.airSpeed = newSpeed;
             windSpeedText.text = newSpeed.ToString("F2");
+            if (newSpeed <= 2f)
+            {
+                motionBody.strength = newSpeed;
+                motionSpeedSlider.value = newSpeed;
+                motionSpeedText.text = newSpeed.ToString("F2");
+            }
+            formulaCalc.UpdatePowerFormulaDisplay(newSpeed);
         }
     }
 
