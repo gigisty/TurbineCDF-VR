@@ -981,7 +981,7 @@ GameObject:
   - component: {fileID: 105049278}
   - component: {fileID: 105049279}
   m_Layer: 5
-  m_Name: Speedsldr
+  m_Name: AirDensitysldr
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
@@ -2845,6 +2845,14 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::FormulaCalculator
   formulaText: {fileID: 811380842}
   vR: {fileID: 132954961}
+  airDensitysldr: {fileID: 105049279}
+  airText: {fileID: 408706945}
+  rotorRadioussldr: {fileID: 2082081164}
+  rotorText: {fileID: 760186432}
+  powerCoefficientsldr: {fileID: 1203233163}
+  powerText: {fileID: 922633389}
+  generatorEfficiencysldr: {fileID: 2055259942}
+  generatorText: {fileID: 708813525}
   airDensity: 1.225
   rotorRadius: 5
   powerCoefficient: 0.4
@@ -6351,7 +6359,7 @@ GameObject:
   - component: {fileID: 1203233162}
   - component: {fileID: 1203233163}
   m_Layer: 5
-  m_Name: Speedsldr (2)
+  m_Name: PowerCoefficientsldr
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
@@ -11253,7 +11261,7 @@ GameObject:
   - component: {fileID: 2055259941}
   - component: {fileID: 2055259942}
   m_Layer: 5
-  m_Name: Speedsldr (3)
+  m_Name: SystemEfficiencysldr
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
@@ -11420,7 +11428,7 @@ GameObject:
   - component: {fileID: 2082081163}
   - component: {fileID: 2082081164}
   m_Layer: 5
-  m_Name: Speedsldr (1)
+  m_Name: SweptAreasldr
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0

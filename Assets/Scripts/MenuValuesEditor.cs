@@ -58,7 +58,7 @@ public class MenuValuesEditor : MonoBehaviour
                 motionSpeedSlider.value = newSpeed;
                 motionSpeedText.text = newSpeed.ToString("F2");
             }
-            formulaCalc.UpdatePowerFormulaDisplay(newSpeed);
+            formulaCalc.UpdatePowerFormulaDisplay();
         }
     }
 
@@ -68,6 +68,7 @@ public class MenuValuesEditor : MonoBehaviour
         {
             motionBody.strength = newStrenght;
             motionSpeedText.text = newStrenght.ToString("F2");
+            formulaCalc.UpdatePowerFormulaDisplay();
         }
     }
 }
