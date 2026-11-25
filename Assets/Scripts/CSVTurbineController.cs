@@ -23,7 +23,7 @@ public class CSVTurbineController : MonoBehaviour
     [Tooltip("Opcional: rotar el túnel según Wind Direction (°) del CSV")]
     public bool applyWindDirection = false;
 
-    [Header("Data Import (T1.csv)")]
+    [Header("Data Import")]
     public TextAsset csvDataFile;
     [Tooltip("Limita cuántas filas cargar para que el Slider sea manejable en VR (144 = 1 día cada 10 min. Usa 0 para cargar las 50,530 filas)")]
     public int maxRowsToLoad = 144;
@@ -34,12 +34,7 @@ public class CSVTurbineController : MonoBehaviour
     public Slider timeIndexSlider;
     public TextMeshProUGUI timeDisplayText;
     public TextMeshProUGUI formulaText;
-
-    [Header("Parámetros Fijos de Turbina")]
-    public float airDensity = 1.225f;        // kg/m³ (T1.csv no incluye densidad)
-    public float rotorRadius = 45f;          // Radio en metros (~45-50m corresponde a esta turbina de 3.6 MW)
-    public float powerCoefficient = 0.4f;    // Cp aerodinámico
-    public float generatorEfficiency = 0.85f;// Eficiencia del generador
+    public FormulaCalculatorTime formulaCalc;
 
     private List<WeatherDataPoint> dataPoints = new List<WeatherDataPoint>();
 
@@ -122,22 +117,6 @@ public class CSVTurbineController : MonoBehaviour
             }
         }
 
-        UpdatePowerFormula(currentData);
-    }
-
-    private void UpdatePowerFormula(WeatherDataPoint data)
-    {
-        if (formulaText == null) return;
-
-        float sweptArea = Mathf.PI * Mathf.Pow(rotorRadius, 2);
-        float powerWatts = 0.5f * airDensity * sweptArea * Mathf.Pow(data.windSpeed, 3) * powerCoefficient * generatorEfficiency;
-        float powerKW = powerWatts / 1000f;
-
-        formulaText.text = "<b>Fórmula Base:</b>\n" +
-                           "P = ½ · ρ · A · v³ · Cp · η\n\n" +
-                           "<b>Cálculo Dinámico:</b>\n" +
-                           $"P = 0.5 · {airDensity:F3} · {sweptArea:F1}m² · <b>{data.windSpeed:F2}³</b> · {powerCoefficient} · {generatorEfficiency}\n\n" +
-                           $"<b>Potencia Calculada:</b> <color=#55FF55>{powerKW:F2} kW</color>\n" +
-                           $"<b>Potencia Real SCADA (CSV):</b> <color=#55CCFF>{data.actualPowerKW:F2} kW</color>";
+        formulaCalc.UpdatePowerFormulaDisplay();
     }
 }

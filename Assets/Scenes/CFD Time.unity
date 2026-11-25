@@ -1296,10 +1296,7 @@ MonoBehaviour:
   timeIndexSlider: {fileID: 432955210}
   timeDisplayText: {fileID: 433764364}
   formulaText: {fileID: 811380842}
-  airDensity: 1.225
-  rotorRadius: 5
-  powerCoefficient: 0.4
-  generatorEfficiency: 0.8
+  formulaCalc: {fileID: 442765917}
 --- !u!1 &156027807
 GameObject:
   m_ObjectHideFlags: 0
@@ -2865,7 +2862,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!114 &442765910
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -2979,11 +2976,11 @@ MonoBehaviour:
   m_GameObject: {fileID: 442765909}
   m_Enabled: 1
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 7e45d586dfe077b4f8c0b04eb7da303b, type: 3}
+  m_Script: {fileID: 11500000, guid: 3ee912812554a664ca4a3841547e3428, type: 3}
   m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::FormulaCalculator
+  m_EditorClassIdentifier: Assembly-CSharp::FormulaCalculatorTime
   formulaText: {fileID: 811380842}
-  vR: {fileID: 0}
+  vR: {fileID: 132954963}
   airDensitysldr: {fileID: 105049279}
   airText: {fileID: 408706945}
   rotorRadioussldr: {fileID: 2082081164}
